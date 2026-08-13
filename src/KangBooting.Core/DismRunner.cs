@@ -41,7 +41,10 @@ public class DismRunner : IDismRunner
                 (string.IsNullOrWhiteSpace(stderr) ? "Tidak ada detail error dari dism.exe." : stderr.Trim()));
         }
 
-        File.Delete(wimPath);
+        // Deliberately does not delete wimPath: this method only reads the source (DISM
+        // needs no write access to it), and callers may pass a read-only source (e.g. a
+        // natively-mounted ISO's install.wim, which cannot be deleted) — cleanup of any
+        // caller-owned temp copy is the caller's responsibility, not this method's.
     }
 
     internal static string BuildSplitArguments(string wimPath, string outputSwmPath, int maxSizeMb)

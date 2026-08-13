@@ -48,8 +48,21 @@ public class FlashViewModel : INotifyPropertyChanged
     public WriteProgress? CurrentProgress
     {
         get => _currentProgress;
-        private set => SetField(ref _currentProgress, value);
+        private set
+        {
+            if (SetField(ref _currentProgress, value))
+            {
+                OnPropertyChanged(nameof(ProgressLabel));
+            }
+        }
     }
+
+    // Combines the operation name and percent into one bindable string, since the UI
+    // previously bound only the ProgressBar's numeric Value — the operation label and
+    // percent text were never actually shown anywhere.
+    public string ProgressLabel => CurrentProgress is null
+        ? ""
+        : $"{CurrentProgress.CurrentOperation} - {CurrentProgress.PercentComplete:F0}%";
 
     public FlashViewModel(
         IIsoInspector isoInspector,
@@ -139,15 +152,16 @@ public class FlashViewModel : INotifyPropertyChanged
     // (e.g. a ComboBox two-way-bound to SelectedDrive recursing into a
     // StackOverflowException when the setter unconditionally re-raised
     // PropertyChanged even for an unchanged value).
-    private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
         if (EqualityComparer<T>.Default.Equals(field, value))
         {
-            return;
+            return false;
         }
 
         field = value;
         OnPropertyChanged(propertyName);
+        return true;
     }
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)

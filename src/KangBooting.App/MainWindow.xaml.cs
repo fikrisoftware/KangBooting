@@ -17,14 +17,15 @@ public sealed partial class MainWindow : Window
         var partitioner = new Partitioner();
         var dismRunner = new DismRunner();
         var bootsectRunner = new BootsectRunner();
+        var isoMounter = new IsoMounter();
 
         ViewModel = new FlashViewModel(
             isoInspector: new IsoInspector(),
             driveService: driveService,
             checksumService: new ChecksumService(),
             writeEngineFactory: mode => mode == BootMode.UefiNtfs
-                ? new UefiNtfsWriter(driveService, partitioner)
-                : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner));
+                ? new UefiNtfsWriter(driveService, partitioner, isoMounter)
+                : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner, isoMounter));
 
         try
         {

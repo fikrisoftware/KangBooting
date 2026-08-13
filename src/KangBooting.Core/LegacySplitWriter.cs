@@ -8,24 +8,19 @@ public class LegacySplitWriter : IWriteEngine
     private readonly IPartitioner _partitioner;
     private readonly IDismRunner _dismRunner;
     private readonly IBootsectRunner _bootsectRunner;
+    private readonly IIsoMounter _isoMounter;
 
     private const int FourGigabytes = 4000; // MB, matches spec's split threshold
-    // IOCTL_DISK_UPDATE_PROPERTIES (Partitioner.RefreshPartitionTable) fires while the
-    // old volume's lock handle is still open (inside LockVolume's using-block in
-    // WriteAsync below) — observed on real hardware to mean Windows' mount manager
-    // doesn't finish reassigning a drive letter until well after that handle closes,
-    // often several seconds later. 5 attempts * 300ms (1.5s total) was not enough in
-    // practice; widened to give the mount manager realistic time to catch up.
-    private const int DriveLetterRetryAttempts = 30;
-    private static readonly TimeSpan DriveLetterRetryDelay = TimeSpan.FromMilliseconds(500);
 
     public LegacySplitWriter(
-        IDriveService driveService, IPartitioner partitioner, IDismRunner dismRunner, IBootsectRunner bootsectRunner)
+        IDriveService driveService, IPartitioner partitioner, IDismRunner dismRunner,
+        IBootsectRunner bootsectRunner, IIsoMounter isoMounter)
     {
         _driveService = driveService;
         _partitioner = partitioner;
         _dismRunner = dismRunner;
         _bootsectRunner = bootsectRunner;
+        _isoMounter = isoMounter;
     }
 
     public async Task WriteAsync(
@@ -36,8 +31,156 @@ public class LegacySplitWriter : IWriteEngine
     {
         progress.Report(new WriteProgress(0, 0, null, "Formatting"));
 
-        // I6: fail fast, before wiping the drive, if there's clearly not enough room
-        // for the extracted ISO on the system temp drive.
+        PartitionHandle fat32Partition;
+        using (var volumeLock = _driveService.LockVolume(target.DeviceId))
+        {
+            fat32Partition = await _partitioner.CreateLegacyFat32LayoutAsync(target, ct);
+        }
+
+        // Release the raw Disk handle opened during formatting now, before asking
+        // Windows for a drive letter below — holding it open blocks the OS's mount
+        // manager from fully re-enumerating the disk.
+        _partitioner.ReleaseOpenDisks();
+
+        progress.Report(new WriteProgress(10, 0, null, "Menunggu drive letter"));
+        var usbDriveLetter = await DriveLetterResolver.ResolveWithRetryAsync(_driveService, target.DeviceId, fat32Partition.PartitionIndex, ct);
+        if (usbDriveLetter is null)
+        {
+            throw new IOException(
+                "Partisi FAT32 berhasil dibuat tetapi Windows belum memberi drive letter. " +
+                "Coba lepas dan pasang ulang drive USB.");
+        }
+
+        await CopyIsoContentsAsync(isoPath, usbDriveLetter, progress, ct);
+
+        progress.Report(new WriteProgress(95, 0, null, "Menulis boot code"));
+        await _bootsectRunner.WriteBootCodeAsync(usbDriveLetter, ct);
+
+        progress.Report(new WriteProgress(100, 0, TimeSpan.Zero, "Selesai"));
+    }
+
+    // Prefer mounting the ISO via Windows' own UDF/ISO9660 driver (IIsoMounter) over
+    // reading it through DiscUtils (IsoFileSystemOpener): native mounting sidesteps two
+    // real bugs found in DiscUtils when this was built against a real Windows 11 ISO —
+    // its ISO9660/Joliet reader saw an almost-empty disc (real content lived in the UDF
+    // layer it doesn't read), and its FAT writer rejected valid multi-dot filenames
+    // (e.g. "bootsect.exe.mui") that Windows itself writes/reads without issue. Falls
+    // back to the DiscUtils-based extract-to-staging path only if native mounting itself
+    // fails (e.g. Mount-DiskImage unavailable/blocked in some environment).
+    private async Task CopyIsoContentsAsync(
+        string isoPath, string usbDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
+    {
+        var mount = await TryGetOrMountAsync(isoPath, ct);
+        if (mount is null)
+        {
+            await CopyViaStagingExtractionAsync(isoPath, usbDriveLetter, progress, ct);
+            return;
+        }
+
+        var (mountedDriveLetter, weMountedIt) = mount.Value;
+        try
+        {
+            await CopyFromMountedIsoAsync(mountedDriveLetter, usbDriveLetter, progress, ct);
+        }
+        finally
+        {
+            if (weMountedIt)
+            {
+                // Best-effort on a fixed token: dismounting is cleanup, not part of the
+                // operation being cancelled, so it should still run even if `ct` fired.
+                await _isoMounter.DismountAsync(isoPath, CancellationToken.None);
+            }
+        }
+    }
+
+    // Checks for an already-mounted instance first (never double-mount the same ISO —
+    // if the user or another tool already has it mounted, reuse that mount and don't
+    // dismount it when done). Returns null if mounting isn't possible at all, signalling
+    // the caller to fall back to DiscUtils-based reading.
+    private async Task<(string driveLetter, bool weMountedIt)?> TryGetOrMountAsync(string isoPath, CancellationToken ct)
+    {
+        try
+        {
+            var existing = await _isoMounter.GetExistingMountedDriveLetterAsync(isoPath, ct);
+            if (existing is not null)
+            {
+                return (existing, false);
+            }
+
+            var mounted = await _isoMounter.MountAsync(isoPath, ct);
+            return (mounted, true);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task CopyFromMountedIsoAsync(
+        string mountedDriveLetter, string usbDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
+    {
+        var sourceRoot = mountedDriveLetter + @"\";
+
+        var wimPath = Path.Combine(sourceRoot, "sources", "install.wim");
+        var esdPath = Path.Combine(sourceRoot, "sources", "install.esd");
+        var imagePath = File.Exists(wimPath) ? wimPath : File.Exists(esdPath) ? esdPath : null;
+
+        string? excludeRelativePath = imagePath is not null && new FileInfo(imagePath).Length > FourGigabytes * 1024L * 1024
+            ? Path.GetRelativePath(sourceRoot, imagePath)
+            : null;
+
+        progress.Report(new WriteProgress(20, 0, null, "Copying files"));
+        var totalBytes = RealFileSystemCopier.ComputeTotalBytes(sourceRoot, excludeRelativePath);
+        var copyRangeSpan = excludeRelativePath is null ? 60 : 50;
+        var tracker = new CopyProgressTracker(progress, rangeStart: 20, rangeSpan: copyRangeSpan, "Copying files", totalBytes);
+        RealFileSystemCopier.CopyDirectory(sourceRoot, usbDriveLetter, tracker, ct, excludeRelativePath);
+
+        if (excludeRelativePath is not null)
+        {
+            await SplitAndCopyInstallImageAsync(imagePath!, usbDriveLetter, progress, ct);
+        }
+    }
+
+    // Splits the oversized install.wim/.esd into a small temp directory (only the split
+    // chunks, not a copy of the whole ISO) and copies just those chunks onto the USB —
+    // much less temp disk usage than the old extract-everything-first approach.
+    private async Task SplitAndCopyInstallImageAsync(
+        string imagePath, string usbDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
+    {
+        var imageSizeBytes = new FileInfo(imagePath).Length;
+        var tempFreeBytes = new System.IO.DriveInfo(Path.GetPathRoot(Path.GetTempPath())!).AvailableFreeSpace;
+        if (tempFreeBytes < imageSizeBytes)
+        {
+            throw new InvalidOperationException(
+                $"Ruang kosong di drive sistem (temp) tidak cukup untuk memecah {Path.GetFileName(imagePath)}.");
+        }
+
+        progress.Report(new WriteProgress(70, 0, null, $"Splitting {Path.GetFileName(imagePath)}"));
+        var tempSplitDir = Directory.CreateTempSubdirectory("kangbooting-split").FullName;
+        try
+        {
+            var swmPath = Path.Combine(tempSplitDir, "install.swm");
+            await _dismRunner.SplitWimAsync(imagePath, swmPath, FourGigabytes, ct);
+
+            var destSourcesDir = Path.Combine(usbDriveLetter + @"\", "sources");
+            Directory.CreateDirectory(destSourcesDir);
+            foreach (var swmFile in Directory.GetFiles(tempSplitDir, "install*.swm"))
+            {
+                File.Copy(swmFile, Path.Combine(destSourcesDir, Path.GetFileName(swmFile)), overwrite: true);
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempSplitDir, recursive: true);
+        }
+    }
+
+    // Fallback used only if native ISO mounting itself fails. Matches the original
+    // extract-to-staging approach: read via DiscUtils (UDF-first, ISO9660 fallback),
+    // extract everything to a temp directory, split if needed, then copy to the USB.
+    private async Task CopyViaStagingExtractionAsync(
+        string isoPath, string usbDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
+    {
         var isoSizeBytes = new FileInfo(isoPath).Length;
         var tempFreeBytes = new System.IO.DriveInfo(Path.GetPathRoot(Path.GetTempPath())!).AvailableFreeSpace;
         if (tempFreeBytes < isoSizeBytes)
@@ -52,76 +195,23 @@ public class LegacySplitWriter : IWriteEngine
             using (var isoStream = File.OpenRead(isoPath))
             using (var isoFileSystem = IsoFileSystemOpener.Open(isoStream))
             {
-                progress.Report(new WriteProgress(10, 0, null, "Extracting ISO"));
+                progress.Report(new WriteProgress(15, 0, null, "Extracting ISO"));
                 var extractTotalBytes = ComputeTotalBytes(isoFileSystem);
-                var extractTracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 30, "Extracting ISO", extractTotalBytes);
+                var extractTracker = new CopyProgressTracker(progress, rangeStart: 15, rangeSpan: 35, "Extracting ISO", extractTotalBytes);
                 ExtractIsoToDirectory(isoFileSystem, stagingDir, tracker: extractTracker, ct: ct);
             }
 
-            await SplitInstallImageIfNeededAsync(stagingDir, progress, ct);
+            await SplitStagingImageIfNeededAsync(stagingDir, progress, ct);
 
-            PartitionHandle fat32Partition;
-            using (var volumeLock = _driveService.LockVolume(target.DeviceId))
-            {
-                fat32Partition = await _partitioner.CreateLegacyFat32LayoutAsync(target, ct);
-
-                progress.Report(new WriteProgress(80, 0, null, "Copying files"));
-                using var fat32 = _partitioner.OpenFat32FileSystem(fat32Partition);
-                var copyTotalBytes = ComputeStagingDirTotalBytes(stagingDir);
-                var copyTracker = new CopyProgressTracker(progress, rangeStart: 80, rangeSpan: 13, "Copying files", copyTotalBytes);
-                CopyDirectoryToFileSystem(stagingDir, fat32, "", copyTracker, ct);
-            }
-
-            // Release the Disk handle opened by OpenFat32FileSystem now, before waiting
-            // for Windows to assign a drive letter below — holding it open blocks the
-            // OS's mount manager from fully re-enumerating the disk (same root cause as
-            // the leaked-handle-blocks-retry bug this fixes; here it also plausibly
-            // delays/prevents drive-letter assignment on the same attempt).
-            _partitioner.ReleaseOpenDisks();
-
-            // C2: write BIOS-bootable MBR/VBR boot code onto the FAT32 partition now that
-            // it's formatted and populated. Requires a drive letter, which PartitionHandle
-            // (a raw DeviceId+PartitionIndex reference) doesn't carry — resolved via WMI,
-            // with a short retry loop since Windows may take a moment after
-            // IOCTL_DISK_UPDATE_PROPERTIES (see Partitioner.RefreshPartitionTable) to
-            // finish assigning one. Unverified on real hardware.
-            progress.Report(new WriteProgress(95, 0, null, "Menulis boot code"));
-            var driveLetter = await ResolveDriveLetterWithRetryAsync(target.DeviceId, fat32Partition.PartitionIndex, ct);
-            if (driveLetter is null)
-            {
-                throw new IOException(
-                    "Partisi FAT32 berhasil dibuat tetapi Windows belum memberi drive letter untuk menulis boot code. " +
-                    "Drive kemungkinan tidak akan bisa boot dari BIOS/Legacy - coba lepas dan pasang ulang drive USB.");
-            }
-
-            await _bootsectRunner.WriteBootCodeAsync(driveLetter, ct);
+            progress.Report(new WriteProgress(85, 0, null, "Copying files"));
+            var copyTotalBytes = RealFileSystemCopier.ComputeTotalBytes(stagingDir);
+            var copyTracker = new CopyProgressTracker(progress, rangeStart: 85, rangeSpan: 8, "Copying files", copyTotalBytes);
+            RealFileSystemCopier.CopyDirectory(stagingDir, usbDriveLetter, copyTracker, ct);
         }
         finally
         {
-            // Must run even on failure/cancellation: an open Disk handle left over from
-            // a failed attempt blocks a subsequent Retry (same process) from reopening
-            // the same physical disk — confirmed on real hardware.
-            _partitioner.ReleaseOpenDisks();
             Directory.Delete(stagingDir, recursive: true);
         }
-
-        progress.Report(new WriteProgress(100, 0, TimeSpan.Zero, "Selesai"));
-    }
-
-    private async Task<string?> ResolveDriveLetterWithRetryAsync(string deviceId, int partitionIndex, CancellationToken ct)
-    {
-        for (int attempt = 0; attempt < DriveLetterRetryAttempts; attempt++)
-        {
-            var driveLetter = _driveService.GetDriveLetterForPartition(deviceId, partitionIndex);
-            if (driveLetter is not null)
-            {
-                return driveLetter;
-            }
-
-            await Task.Delay(DriveLetterRetryDelay, ct);
-        }
-
-        return null;
     }
 
     // I3: install.esd (also a valid Windows install image, per IsoInspector) hit the
@@ -130,7 +220,7 @@ public class LegacySplitWriter : IWriteEngine
     // DISM's /Split-Image operates on WIM-family container images regardless of the
     // .wim/.esd extension (both are documented as supported source formats), so
     // DismRunner.SplitWimAsync is reused as-is for .esd too.
-    private async Task SplitInstallImageIfNeededAsync(
+    private async Task SplitStagingImageIfNeededAsync(
         string stagingDir, IProgress<WriteProgress> progress, CancellationToken ct)
     {
         var wimPath = Path.Combine(stagingDir, "sources", "install.wim");
@@ -150,6 +240,7 @@ public class LegacySplitWriter : IWriteEngine
         progress.Report(new WriteProgress(50, 0, null, $"Splitting {Path.GetFileName(imagePath)}"));
         var swmPath = Path.Combine(stagingDir, "sources", "install.swm");
         await _dismRunner.SplitWimAsync(imagePath, swmPath, FourGigabytes, ct);
+        File.Delete(imagePath);
     }
 
     internal static void ExtractIsoToDirectory(
@@ -207,40 +298,4 @@ public class LegacySplitWriter : IWriteEngine
         return total;
     }
 
-    private static long ComputeStagingDirTotalBytes(string stagingDir)
-    {
-        long total = 0;
-        foreach (var file in Directory.EnumerateFiles(stagingDir, "*", SearchOption.AllDirectories))
-        {
-            total += new FileInfo(file).Length;
-        }
-
-        return total;
-    }
-
-    private static void CopyDirectoryToFileSystem(
-        string sourceDir, IFileSystem destination, string relativePath,
-        CopyProgressTracker? tracker = null, CancellationToken ct = default)
-    {
-        var fullSourceDir = Path.Combine(sourceDir, relativePath);
-
-        foreach (var dir in Directory.GetDirectories(fullSourceDir))
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var relDir = Path.GetRelativePath(sourceDir, dir);
-            destination.CreateDirectory(relDir);
-            CopyDirectoryToFileSystem(sourceDir, destination, relDir, tracker, ct);
-        }
-
-        foreach (var file in Directory.GetFiles(fullSourceDir))
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var relFile = Path.GetRelativePath(sourceDir, file);
-            using var sourceStream = File.OpenRead(file);
-            using var destStream = destination.OpenFile(relFile, FileMode.Create, FileAccess.Write);
-            CopyProgressTracker.CopyStreamWithProgress(sourceStream, destStream, tracker, ct);
-        }
-    }
 }
