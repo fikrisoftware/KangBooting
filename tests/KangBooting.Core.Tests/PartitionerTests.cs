@@ -37,36 +37,44 @@ public class PartitionerTests
     [Fact]
     public void BuildCreatePartitionScript_FixedSize_UsesSizeArgument()
     {
-        var script = Partitioner.BuildCreatePartitionScript(diskNumber: 1, sizeMB: 16, isActive: true, fileSystem: "FAT");
+        var script = Partitioner.BuildCreatePartitionScript(diskNumber: 1, sizeMB: 16, isActive: true);
 
         Assert.Contains("New-Partition -DiskNumber 1 -Size 16MB -IsActive -AssignDriveLetter", script);
-        Assert.Contains("Format-Volume -Partition $p -FileSystem FAT", script);
-        // Regression guard: real-hardware bug — New-Partition -MbrType EFI is rejected
-        // on some Windows/PowerShell Storage module versions ("Cannot convert value
-        // 'EFI'... Specify one of: FAT12, FAT16, Extended, Huge, IFS, FAT32"). No
-        // -MbrType is passed here at all; the exact type byte is patched afterward via
-        // diskpart (BuildSetPartitionTypeDiskpartScript), which accepts an arbitrary
-        // raw byte and has been stable across Windows versions.
+        // Regression guard: real-hardware bug #1 — New-Partition -MbrType EFI is
+        // rejected on some Windows/PowerShell Storage module versions. Regression
+        // guard #2 — Format-Volume refuses NTFS on removable USB media ("Not
+        // Supported"), so no formatting happens here at all; both the MBR type byte
+        // and the actual format are done afterward via diskpart
+        // (BuildFormatPartitionDiskpartScript), which is subject to neither restriction.
         Assert.DoesNotContain("MbrType", script);
+        Assert.DoesNotContain("Format-Volume", script);
         Assert.DoesNotContain("\"", script); // no embedded double quotes — see class comment on escaping
     }
 
     [Fact]
     public void BuildCreatePartitionScript_NoSize_UsesMaximumSize()
     {
-        var script = Partitioner.BuildCreatePartitionScript(diskNumber: 1, sizeMB: null, isActive: false, fileSystem: "NTFS");
+        var script = Partitioner.BuildCreatePartitionScript(diskNumber: 1, sizeMB: null, isActive: false);
 
         Assert.Contains("New-Partition -DiskNumber 1 -UseMaximumSize -AssignDriveLetter", script);
         Assert.DoesNotContain("-IsActive", script);
-        Assert.Contains("Format-Volume -Partition $p -FileSystem NTFS", script);
     }
 
     [Fact]
-    public void BuildSetPartitionTypeDiskpartScript_SelectsDiskAndPartitionThenSetsId()
+    public void BuildFormatPartitionDiskpartScript_WithMbrType_SetsIdBeforeFormat()
     {
-        var script = Partitioner.BuildSetPartitionTypeDiskpartScript(diskNumber: 1, partitionNumber: 2, mbrTypeHex: "ef");
+        var script = Partitioner.BuildFormatPartitionDiskpartScript(diskNumber: 1, partitionNumber: 2, fileSystem: "fat", mbrTypeHex: "ef");
 
-        Assert.Equal("select disk 1\r\nselect partition 2\r\nset id=ef override\r\n", script);
+        Assert.Equal("select disk 1\r\nselect partition 2\r\nset id=ef override\r\nformat fs=fat quick label=\"KANGBOOT\"\r\n", script);
+    }
+
+    [Fact]
+    public void BuildFormatPartitionDiskpartScript_NoMbrType_SkipsSetId()
+    {
+        var script = Partitioner.BuildFormatPartitionDiskpartScript(diskNumber: 1, partitionNumber: 2, fileSystem: "ntfs", mbrTypeHex: null);
+
+        Assert.Equal("select disk 1\r\nselect partition 2\r\nformat fs=ntfs quick label=\"KANGBOOT\"\r\n", script);
+        Assert.DoesNotContain("set id", script);
     }
 
     [Fact]

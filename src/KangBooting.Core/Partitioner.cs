@@ -39,21 +39,24 @@ public class Partitioner : IPartitioner
 
         await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
 
-        var (bootPartitionNumber, bootDriveLetter) = await CreatePartitionAsync(
-            diskNumber, sizeMB: BootPartitionMB, isActive: true, fileSystem: "FAT", ct);
+        var (bootPartitionNumber, bootDriveLetter) = await CreatePartitionOnlyAsync(
+            diskNumber, sizeMB: BootPartitionMB, isActive: true, ct);
 
-        await SetPartitionTypeAsync(diskNumber, bootPartitionNumber, EfiSystemMbrTypeHex, ct);
+        // Real-hardware root cause: Windows' Format-Volume cmdlet (and Disk Management's
+        // GUI formatter) refuses to create an NTFS volume on media Windows classifies as
+        // "Removable" (most USB flash drives) — this is a genuine, longstanding Windows
+        // restriction, not a caching/timing issue ("Update-Disk" was tried first and did
+        // NOT fix it — same "Format-Volume : Not Supported" error reproduced identically
+        // afterward). diskpart's own `format` command is not subject to this restriction,
+        // so both the MBR type-byte patch AND the actual format are done via diskpart for
+        // every partition here; PowerShell is used only for New-Partition (disk-level ops,
+        // partition creation, and drive-letter assignment, which all worked fine).
+        await FormatPartitionViaDiskpartAsync(diskNumber, bootPartitionNumber, "fat", EfiSystemMbrTypeHex, ct);
 
-        // Real-hardware bug: without this, the next New-Partition/Format-Volume call
-        // (data partition) failed with "Format-Volume : Not Supported" — diskpart edits
-        // the partition table via its own APIs, bypassing the Storage Management
-        // service (VDS) that backs New-Partition/Format-Volume/Get-Disk, which then
-        // operates on a stale cached view of the disk. Update-Disk forces VDS to
-        // re-scan before the next partition operation.
-        await RunPowerShellAsync($"Update-Disk -Number {diskNumber}", ct);
+        var (dataPartitionNumber, dataDriveLetter) = await CreatePartitionOnlyAsync(
+            diskNumber, sizeMB: null, isActive: false, ct);
 
-        var (_, dataDriveLetter) = await CreatePartitionAsync(
-            diskNumber, sizeMB: null, isActive: false, fileSystem: "NTFS", ct);
+        await FormatPartitionViaDiskpartAsync(diskNumber, dataPartitionNumber, "ntfs", mbrTypeHex: null, ct);
 
         return (bootDriveLetter, dataDriveLetter);
     }
@@ -65,10 +68,10 @@ public class Partitioner : IPartitioner
 
         await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
 
-        // FAT32 is a valid -MbrType enum value on every Windows version seen so far
-        // (unlike EFI above), so no diskpart type-byte patch is needed here.
-        var (_, driveLetter) = await CreatePartitionAsync(
-            diskNumber, sizeMB: null, isActive: true, fileSystem: "FAT32", ct);
+        var (partitionNumber, driveLetter) = await CreatePartitionOnlyAsync(
+            diskNumber, sizeMB: null, isActive: true, ct);
+
+        await FormatPartitionViaDiskpartAsync(diskNumber, partitionNumber, "fat32", mbrTypeHex: null, ct);
 
         return driveLetter;
     }
@@ -100,14 +103,15 @@ public class Partitioner : IPartitioner
     // Single-quoted PowerShell strings throughout (no embedded double quotes) so the
     // whole script can be wrapped in double quotes as one process argument without
     // needing to escape anything inside it. sizeMB null means -UseMaximumSize.
-    internal static string BuildCreatePartitionScript(int diskNumber, int? sizeMB, bool isActive, string fileSystem)
+    // No Format-Volume here — see CreateUefiNtfsLayoutAsync's comment: formatting is
+    // done via diskpart instead, since Format-Volume refuses NTFS on removable media.
+    internal static string BuildCreatePartitionScript(int diskNumber, int? sizeMB, bool isActive)
     {
         var sizeArg = sizeMB is { } mb ? $"-Size {mb}MB" : "-UseMaximumSize";
         var activeArg = isActive ? " -IsActive" : "";
 
         return $"$ErrorActionPreference = 'Stop'; " +
             $"$p = New-Partition -DiskNumber {diskNumber} {sizeArg}{activeArg} -AssignDriveLetter; " +
-            $"Format-Volume -Partition $p -FileSystem {fileSystem} -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
             $"'{{0}}|{{1}}:' -f $p.PartitionNumber, $p.DriveLetter";
     }
 
@@ -133,27 +137,35 @@ public class Partitioner : IPartitioner
         return (partitionNumber, parts[1]);
     }
 
-    private static async Task<(int partitionNumber, string driveLetter)> CreatePartitionAsync(
-        int diskNumber, int? sizeMB, bool isActive, string fileSystem, CancellationToken ct)
+    private static async Task<(int partitionNumber, string driveLetter)> CreatePartitionOnlyAsync(
+        int diskNumber, int? sizeMB, bool isActive, CancellationToken ct)
     {
-        var script = BuildCreatePartitionScript(diskNumber, sizeMB, isActive, fileSystem);
+        var script = BuildCreatePartitionScript(diskNumber, sizeMB, isActive);
         var output = await RunPowerShellAsync(script, ct);
         return ParsePartitionResult(output);
     }
 
-    internal static string BuildSetPartitionTypeDiskpartScript(int diskNumber, int partitionNumber, string mbrTypeHex) =>
-        $"select disk {diskNumber}\r\n" +
-        $"select partition {partitionNumber}\r\n" +
-        $"set id={mbrTypeHex} override\r\n";
+    // mbrTypeHex is only needed for the UEFI:NTFS boot partition (0xEF); null skips it.
+    // The `set id=` line must come before `format` in the same diskpart invocation.
+    internal static string BuildFormatPartitionDiskpartScript(
+        int diskNumber, int partitionNumber, string fileSystem, string? mbrTypeHex)
+    {
+        var setIdLine = mbrTypeHex is null ? "" : $"set id={mbrTypeHex} override\r\n";
+        return $"select disk {diskNumber}\r\n" +
+            $"select partition {partitionNumber}\r\n" +
+            setIdLine +
+            $"format fs={fileSystem} quick label=\"KANGBOOT\"\r\n";
+    }
 
-    private static async Task SetPartitionTypeAsync(int diskNumber, int partitionNumber, string mbrTypeHex, CancellationToken ct)
+    private static async Task FormatPartitionViaDiskpartAsync(
+        int diskNumber, int partitionNumber, string fileSystem, string? mbrTypeHex, CancellationToken ct)
     {
         var scriptPath = Path.Combine(Path.GetTempPath(), $"kangbooting-diskpart-{Guid.NewGuid():N}.txt");
-        await File.WriteAllTextAsync(scriptPath, BuildSetPartitionTypeDiskpartScript(diskNumber, partitionNumber, mbrTypeHex), ct);
+        await File.WriteAllTextAsync(scriptPath, BuildFormatPartitionDiskpartScript(diskNumber, partitionNumber, fileSystem, mbrTypeHex), ct);
         try
         {
             await RunProcessAsync("diskpart.exe", $"/s \"{scriptPath}\"", ct,
-                errorPrefix: "Gagal mengatur tipe partisi boot");
+                errorPrefix: "Gagal format partisi");
         }
         finally
         {
