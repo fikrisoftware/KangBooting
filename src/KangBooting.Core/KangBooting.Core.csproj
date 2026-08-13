@@ -11,4 +11,12 @@
     <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="KangBooting.Core.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\assets\uefi-ntfs.img" Link="assets\uefi-ntfs.img" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
