@@ -44,6 +44,14 @@ public class Partitioner : IPartitioner
 
         await SetPartitionTypeAsync(diskNumber, bootPartitionNumber, EfiSystemMbrTypeHex, ct);
 
+        // Real-hardware bug: without this, the next New-Partition/Format-Volume call
+        // (data partition) failed with "Format-Volume : Not Supported" — diskpart edits
+        // the partition table via its own APIs, bypassing the Storage Management
+        // service (VDS) that backs New-Partition/Format-Volume/Get-Disk, which then
+        // operates on a stale cached view of the disk. Update-Disk forces VDS to
+        // re-scan before the next partition operation.
+        await RunPowerShellAsync($"Update-Disk -Number {diskNumber}", ct);
+
         var (_, dataDriveLetter) = await CreatePartitionAsync(
             diskNumber, sizeMB: null, isActive: false, fileSystem: "NTFS", ct);
 
