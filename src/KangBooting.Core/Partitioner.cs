@@ -67,6 +67,20 @@ public class Partitioner : IPartitioner
     {
         using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
 
+        // User-reported real-hardware bug: "Corrupt record" from NtfsFileSystem.Format
+        // on a drive that had already been repartitioned several times in this same
+        // session (Legacy full-disk FAT32, then a failed UEFI attempt at a different
+        // boot-partition size). BiosPartitionTable.Initialize only overwrites the MBR's
+        // partition table entries — it does not zero the disk, so stale boot
+        // sectors/NTFS metadata from a PREVIOUS layout (at different partition
+        // boundaries) can remain on disk and confuse a fresh format. Reproducing this
+        // exact call sequence against a pristine in-memory disk of the same size did
+        // NOT reproduce the error, pointing at leftover on-disk state rather than the
+        // partitioning math. Zeroing the regions where boot sectors/filesystem metadata
+        // conventionally live (start and end of the disk) before creating new
+        // partitions removes that ambiguity without the cost of wiping the whole drive.
+        CleanDiskHeaderAndFooter(disk);
+
         // Initialize(disk) alone writes an empty MBR with zero partitions.
         // (Initialize(disk, WellKnownPartitionType) would immediately consume the
         // whole disk with one partition, leaving no room for a second.)
@@ -132,6 +146,10 @@ public class Partitioner : IPartitioner
     {
         using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
 
+        // See CreateUefiNtfsLayout's comment: clears stale boot sectors/filesystem
+        // metadata from a previous layout before creating a fresh one.
+        CleanDiskHeaderAndFooter(disk);
+
         // Initialize(disk, type) creates a single partition spanning the entire disk
         // and already marks it active — no separate SetActive step needed/available.
         var table = BiosPartitionTable.Initialize(disk, WellKnownPartitionType.WindowsFat);
@@ -146,6 +164,35 @@ public class Partitioner : IPartitioner
         FatFileSystem.FormatPartition(disk, index, "KANGBOOT");
 
         return new PartitionHandle(target.DeviceId, index);
+    }
+
+    // Zeroes the regions where partition tables, boot sectors, and filesystem metadata
+    // (MBR/GPT headers, NTFS boot sector + its backup at the volume's last sector, FAT
+    // BPB, etc.) conventionally live, so a fresh format never has to contend with
+    // leftover bytes from whatever was on this disk before. Bounded to a small region at
+    // each end (not the whole disk) - this only needs to outrun the largest boot
+    // partition size we've ever used (BootPartitionBytes) plus alignment, not wipe
+    // multi-GB user data.
+    private static void CleanDiskHeaderAndFooter(Disk disk)
+    {
+        const long headerBytes = BootPartitionBytes + (4 * 1024 * 1024); // + alignment/MBR margin
+        const long footerBytes = 4 * 1024 * 1024; // NTFS backup boot sector, GPT backup header, etc.
+
+        var zeroChunk = new byte[1024 * 1024];
+
+        disk.Content.Position = 0;
+        for (long written = 0; written < headerBytes; written += zeroChunk.Length)
+        {
+            disk.Content.Write(zeroChunk, 0, zeroChunk.Length);
+        }
+
+        var footerStart = Math.Max(0, disk.Capacity - footerBytes);
+        disk.Content.Position = footerStart;
+        for (long written = footerStart; written < disk.Capacity; written += zeroChunk.Length)
+        {
+            var remaining = disk.Capacity - written;
+            disk.Content.Write(zeroChunk, 0, (int)Math.Min(zeroChunk.Length, remaining));
+        }
     }
 
     // I2 fix: after DiscUtils writes a new partition table directly to the raw disk,

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using KangBooting.Core;
 
@@ -11,6 +12,7 @@ public class FlashViewModel : INotifyPropertyChanged
     private readonly IIsoInspector _isoInspector;
     private readonly IDriveService _driveService;
     private readonly IChecksumService _checksumService;
+    private readonly IPrerequisiteChecker _prerequisiteChecker;
     private readonly Func<BootMode, IWriteEngine> _writeEngineFactory;
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -120,11 +122,13 @@ public class FlashViewModel : INotifyPropertyChanged
         IIsoInspector isoInspector,
         IDriveService driveService,
         IChecksumService checksumService,
+        IPrerequisiteChecker prerequisiteChecker,
         Func<BootMode, IWriteEngine> writeEngineFactory)
     {
         _isoInspector = isoInspector;
         _driveService = driveService;
         _checksumService = checksumService;
+        _prerequisiteChecker = prerequisiteChecker;
         _writeEngineFactory = writeEngineFactory;
     }
 
@@ -159,6 +163,16 @@ public class FlashViewModel : INotifyPropertyChanged
         if (SelectedIsoPath is null || SelectedDrive is null)
         {
             throw new InvalidOperationException("Pilih ISO dan drive terlebih dahulu sebelum flash.");
+        }
+
+        // Fail fast, before touching the drive: a missing tool (dism.exe, bootsect.exe,
+        // powershell.exe) or asset should surface clearly up front, not partway through
+        // after the drive has already been wiped.
+        var issues = _prerequisiteChecker.Check(SelectedBootMode, SelectedIsoPath);
+        if (issues.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "Prasyarat belum terpenuhi:\n" + string.Join("\n", issues.Select(i => $"- {i}")));
         }
 
         // I6: fail fast, before wiping the drive, if it's clearly too small for the ISO.

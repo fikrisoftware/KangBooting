@@ -39,6 +39,7 @@ public sealed partial class MainWindow : Window
             isoInspector: new IsoInspector(),
             driveService: driveService,
             checksumService: new ChecksumService(),
+            prerequisiteChecker: new PrerequisiteChecker(),
             writeEngineFactory: mode => mode == BootMode.UefiNtfs
                 ? new UefiNtfsWriter(driveService, partitioner, isoMounter)
                 : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner, isoMounter));
