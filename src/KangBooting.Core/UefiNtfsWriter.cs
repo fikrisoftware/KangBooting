@@ -30,8 +30,9 @@ public class UefiNtfsWriter : IWriteEngine
             var (bootPartition, dataPartition) = await _partitioner
                 .CreateUefiNtfsLayoutAsync(target, ct);
 
+            var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "uefi-ntfs.img");
             await _partitioner.WriteBootloaderImageAsync(
-                bootPartition, "assets/uefi-ntfs.img", ct);
+                bootPartition, bootloaderImagePath, ct);
 
             progress.Report(new WriteProgress(10, 0, null, "Copying files"));
 
