@@ -1,5 +1,6 @@
 using KangBooting.Core;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using WinRT.Interop;
 
 namespace KangBooting.App;
@@ -80,6 +81,18 @@ public sealed partial class MainWindow : Window
 
     private async Task RunFlashAsync()
     {
+        // Per the design spec's data flow: explicit user confirmation before wiping the
+        // drive. Skip the dialog if ISO/drive aren't selected yet — let FlashAsync's
+        // own validation surface that clearer error instead.
+        if (ViewModel.SelectedIsoPath is not null && ViewModel.SelectedDrive is not null)
+        {
+            var confirmed = await ConfirmFlashAsync(ViewModel.SelectedDrive.DisplayName);
+            if (!confirmed)
+            {
+                return;
+            }
+        }
+
         FlashButton.IsEnabled = false;
         RetryButton.Visibility = Visibility.Collapsed;
         CancelButton.Visibility = Visibility.Visible;
@@ -105,5 +118,21 @@ public sealed partial class MainWindow : Window
             FlashButton.IsEnabled = true;
             CancelButton.Visibility = Visibility.Collapsed;
         }
+    }
+
+    private async Task<bool> ConfirmFlashAsync(string driveDisplayName)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Konfirmasi Flash",
+            Content = $"Semua data di drive \"{driveDisplayName}\" akan dihapus permanen dan tidak bisa dikembalikan. Lanjutkan?",
+            PrimaryButtonText = "Ya, Flash",
+            CloseButtonText = "Batal",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        return result == ContentDialogResult.Primary;
     }
 }

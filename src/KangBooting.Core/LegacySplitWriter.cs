@@ -54,7 +54,9 @@ public class LegacySplitWriter : IWriteEngine
             using (var cdReader = new CDReader(isoStream, joliet: true))
             {
                 progress.Report(new WriteProgress(10, 0, null, "Extracting ISO"));
-                ExtractIsoToDirectory(cdReader, stagingDir);
+                var extractTotalBytes = ComputeTotalBytes(cdReader);
+                var extractTracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 30, "Extracting ISO", extractTotalBytes);
+                ExtractIsoToDirectory(cdReader, stagingDir, tracker: extractTracker, ct: ct);
             }
 
             await SplitInstallImageIfNeededAsync(stagingDir, progress, ct);
@@ -66,7 +68,9 @@ public class LegacySplitWriter : IWriteEngine
 
                 progress.Report(new WriteProgress(80, 0, null, "Copying files"));
                 using var fat32 = _partitioner.OpenFat32FileSystem(fat32Partition);
-                CopyDirectoryToFileSystem(stagingDir, fat32, "");
+                var copyTotalBytes = ComputeStagingDirTotalBytes(stagingDir);
+                var copyTracker = new CopyProgressTracker(progress, rangeStart: 80, rangeSpan: 13, "Copying files", copyTotalBytes);
+                CopyDirectoryToFileSystem(stagingDir, fat32, "", copyTracker, ct);
             }
 
             // Release the Disk handle opened by OpenFat32FileSystem now, before waiting
@@ -149,28 +153,34 @@ public class LegacySplitWriter : IWriteEngine
         await _dismRunner.SplitWimAsync(imagePath, swmPath, FourGigabytes, ct);
     }
 
-    internal static void ExtractIsoToDirectory(CDReader source, string destinationDir, string path = "")
+    internal static void ExtractIsoToDirectory(
+        CDReader source, string destinationDir, string path = "",
+        CopyProgressTracker? tracker = null, CancellationToken ct = default)
     {
         // ponytail: GetDirectories(path)/GetFiles(path) without SearchOption default to
         // TopDirectoryOnly (same convention as System.IO), so this recurses manually —
         // the brief's single-level version would silently skip sources\install.wim.
         foreach (var dir in source.GetDirectories(path))
         {
+            ct.ThrowIfCancellationRequested();
+
             // ponytail: DiscUtils returns paths like "\sources" — Path.Combine treats a
             // leading separator as drive-rooted, so trim it before combining (same fix
             // as UefiNtfsWriter.StripIsoVersionSuffix handles for the ";1" file suffix).
             Directory.CreateDirectory(Path.Combine(destinationDir, TrimLeadingSeparator(dir)));
-            ExtractIsoToDirectory(source, destinationDir, dir);
+            ExtractIsoToDirectory(source, destinationDir, dir, tracker, ct);
         }
 
         foreach (var file in source.GetFiles(path))
         {
+            ct.ThrowIfCancellationRequested();
+
             var relativePath = TrimLeadingSeparator(StripIsoVersionSuffix(file));
             var destPath = Path.Combine(destinationDir, relativePath);
             Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
             using var sourceStream = source.OpenFile(file, FileMode.Open);
             using var destStream = File.Create(destPath);
-            sourceStream.CopyTo(destStream);
+            CopyProgressTracker.CopyStreamWithProgress(sourceStream, destStream, tracker, ct);
         }
     }
 
@@ -182,23 +192,56 @@ public class LegacySplitWriter : IWriteEngine
         return semicolonIndex >= 0 ? isoPath[..semicolonIndex] : isoPath;
     }
 
-    private static void CopyDirectoryToFileSystem(string sourceDir, IFileSystem destination, string relativePath)
+    private static long ComputeTotalBytes(CDReader source, string path = "")
+    {
+        long total = 0;
+        foreach (var dir in source.GetDirectories(path))
+        {
+            total += ComputeTotalBytes(source, dir);
+        }
+
+        foreach (var file in source.GetFiles(path))
+        {
+            total += source.GetFileInfo(file).Length;
+        }
+
+        return total;
+    }
+
+    private static long ComputeStagingDirTotalBytes(string stagingDir)
+    {
+        long total = 0;
+        foreach (var file in Directory.EnumerateFiles(stagingDir, "*", SearchOption.AllDirectories))
+        {
+            total += new FileInfo(file).Length;
+        }
+
+        return total;
+    }
+
+    private static void CopyDirectoryToFileSystem(
+        string sourceDir, IFileSystem destination, string relativePath,
+        CopyProgressTracker? tracker = null, CancellationToken ct = default)
     {
         var fullSourceDir = Path.Combine(sourceDir, relativePath);
 
         foreach (var dir in Directory.GetDirectories(fullSourceDir))
         {
+            ct.ThrowIfCancellationRequested();
+
             var relDir = Path.GetRelativePath(sourceDir, dir);
             destination.CreateDirectory(relDir);
-            CopyDirectoryToFileSystem(sourceDir, destination, relDir);
+            CopyDirectoryToFileSystem(sourceDir, destination, relDir, tracker, ct);
         }
 
         foreach (var file in Directory.GetFiles(fullSourceDir))
         {
+            ct.ThrowIfCancellationRequested();
+
             var relFile = Path.GetRelativePath(sourceDir, file);
             using var sourceStream = File.OpenRead(file);
             using var destStream = destination.OpenFile(relFile, FileMode.Create, FileAccess.Write);
-            sourceStream.CopyTo(destStream);
+            CopyProgressTracker.CopyStreamWithProgress(sourceStream, destStream, tracker, ct);
         }
     }
 }

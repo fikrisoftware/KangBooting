@@ -39,7 +39,9 @@ public class UefiNtfsWriter : IWriteEngine
                 progress.Report(new WriteProgress(10, 0, null, "Copying files"));
 
                 using var ntfs = _partitioner.OpenNtfsFileSystem(dataPartition);
-                CopyIsoContentsToFileSystem(cdReader, ntfs, progress);
+                var totalBytes = ComputeTotalBytes(cdReader);
+                var tracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 88, "Copying files", totalBytes);
+                CopyIsoContentsToFileSystem(cdReader, ntfs, tracker, ct);
             }
             finally
             {
@@ -57,25 +59,30 @@ public class UefiNtfsWriter : IWriteEngine
     internal static void CopyIsoContentsToFileSystem(
         CDReader source,
         IFileSystem destination,
-        IProgress<WriteProgress>? progress = null)
+        CopyProgressTracker? tracker = null,
+        CancellationToken ct = default)
     {
-        CopyDirectory(source, destination, "", progress);
+        CopyDirectory(source, destination, "", tracker, ct);
     }
 
     private static void CopyDirectory(
         CDReader source,
         IFileSystem destination,
         string path,
-        IProgress<WriteProgress>? progress)
+        CopyProgressTracker? tracker,
+        CancellationToken ct)
     {
         foreach (var dir in source.GetDirectories(path))
         {
+            ct.ThrowIfCancellationRequested();
             destination.CreateDirectory(dir);
-            CopyDirectory(source, destination, dir, progress);
+            CopyDirectory(source, destination, dir, tracker, ct);
         }
 
         foreach (var file in source.GetFiles(path))
         {
+            ct.ThrowIfCancellationRequested();
+
             // ISO9660 (non-Joliet-resolved) names carry a ";<version>" suffix
             // (e.g. "install.wim;1") that must be stripped for the destination
             // file system, which has no concept of file versions.
@@ -83,8 +90,24 @@ public class UefiNtfsWriter : IWriteEngine
 
             using var sourceStream = source.OpenFile(file, FileMode.Open);
             using var destStream = destination.OpenFile(destPath, FileMode.Create, FileAccess.Write);
-            sourceStream.CopyTo(destStream);
+            CopyProgressTracker.CopyStreamWithProgress(sourceStream, destStream, tracker, ct);
         }
+    }
+
+    private static long ComputeTotalBytes(CDReader source, string path = "")
+    {
+        long total = 0;
+        foreach (var dir in source.GetDirectories(path))
+        {
+            total += ComputeTotalBytes(source, dir);
+        }
+
+        foreach (var file in source.GetFiles(path))
+        {
+            total += source.GetFileInfo(file).Length;
+        }
+
+        return total;
     }
 
     private static string StripIsoVersionSuffix(string isoPath)
