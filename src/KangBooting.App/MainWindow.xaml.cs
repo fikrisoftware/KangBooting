@@ -16,6 +16,7 @@ public sealed partial class MainWindow : Window
         var driveService = new DriveService();
         var partitioner = new Partitioner();
         var dismRunner = new DismRunner();
+        var bootsectRunner = new BootsectRunner();
 
         ViewModel = new FlashViewModel(
             isoInspector: new IsoInspector(),
@@ -23,7 +24,7 @@ public sealed partial class MainWindow : Window
             checksumService: new ChecksumService(),
             writeEngineFactory: mode => mode == BootMode.UefiNtfs
                 ? new UefiNtfsWriter(driveService, partitioner)
-                : new LegacySplitWriter(driveService, partitioner, dismRunner));
+                : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner));
 
         ViewModel.RefreshDrives();
     }
