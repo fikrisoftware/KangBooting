@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <PackageReference Include="DiscUtils" Version="0.16.13" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
 
 </Project>
