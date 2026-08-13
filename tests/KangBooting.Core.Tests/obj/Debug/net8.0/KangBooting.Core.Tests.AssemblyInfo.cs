@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("KangBooting.Core.Tests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+81616c857c78faf0568629ca9aed6dc5342d981b")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+0a00ecf59b8bd8eabb7f295e680e2a1931ae4dbf")]
 [assembly: System.Reflection.AssemblyProductAttribute("KangBooting.Core.Tests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("KangBooting.Core.Tests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
