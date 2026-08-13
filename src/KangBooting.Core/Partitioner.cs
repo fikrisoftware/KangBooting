@@ -26,6 +26,13 @@ public class Partitioner : IPartitioner
     public Task<(PartitionHandle bootPartition, PartitionHandle dataPartition)> CreateUefiNtfsLayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
+        var result = CreateUefiNtfsLayout(target);
+        RefreshPartitionTable(target.DeviceId);
+        return Task.FromResult(result);
+    }
+
+    private (PartitionHandle bootPartition, PartitionHandle dataPartition) CreateUefiNtfsLayout(UsbDriveInfo target)
+    {
         using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
 
         // Initialize(disk) alone writes an empty MBR with zero partitions.
@@ -70,15 +77,20 @@ public class Partitioner : IPartitioner
             NtfsFileSystem.Format(dataStream, "KANGBOOT", disk.Geometry, dataFirstSector, dataStream.Length / SectorSize);
         }
 
-        var result = (
+        return (
             new PartitionHandle(target.DeviceId, bootIndex),
             new PartitionHandle(target.DeviceId, dataIndex));
-
-        return Task.FromResult(result);
     }
 
     public Task<PartitionHandle> CreateLegacyFat32LayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
+    {
+        var result = CreateLegacyFat32Layout(target);
+        RefreshPartitionTable(target.DeviceId);
+        return Task.FromResult(result);
+    }
+
+    private PartitionHandle CreateLegacyFat32Layout(UsbDriveInfo target)
     {
         using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
 
@@ -95,7 +107,35 @@ public class Partitioner : IPartitioner
 
         FatFileSystem.FormatPartition(disk, index, "KANGBOOT");
 
-        return Task.FromResult(new PartitionHandle(target.DeviceId, index));
+        return new PartitionHandle(target.DeviceId, index);
+    }
+
+    // I2 fix: after DiscUtils writes a new partition table directly to the raw disk,
+    // Windows' own view of the disk (and any drive-letter/volume assignment downstream
+    // code depends on, e.g. DriveService.GetDriveLetterForPartition) is stale until it
+    // re-reads the partition table. IOCTL_DISK_UPDATE_PROPERTIES forces that re-read.
+    // Untested on real hardware — see manual-test-checklist-phase1.md.
+    private static void RefreshPartitionTable(string deviceId)
+    {
+        using var handle = NativeMethods.CreateFile(
+            deviceId,
+            NativeMethods.GENERIC_READ | NativeMethods.GENERIC_WRITE,
+            NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            NativeMethods.OPEN_EXISTING,
+            0,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            // Best-effort: if we can't even open the disk here, downstream code
+            // (drive-letter resolution, next write) will surface a clearer error.
+            return;
+        }
+
+        NativeMethods.DeviceIoControl(
+            handle, NativeMethods.IOCTL_DISK_UPDATE_PROPERTIES,
+            IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
     }
 
     public async Task WriteBootloaderImageAsync(
