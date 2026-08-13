@@ -1,8 +1,12 @@
-# assets/uefi-ntfs.img
+# assets/bootx64_signed.efi
 
-Source: akeo.freeware "uefi-ntfs" project (https://github.com/pbatard/uefi-ntfs), MIT License.
-Used unmodified as the small FAT32 boot partition payload for UEFI:NTFS mode,
-so a UEFI firmware that cannot read NTFS natively can chain-load into the NTFS
-partition containing the actual Windows installer files.
+Source: pbatard/uefi-ntfs release v2.8 (https://github.com/pbatard/uefi-ntfs/releases/tag/v2.8),
+asset `bootx64_signed.efi`. MIT License.
 
-PLACEHOLDER: this file must be replaced with the real binary (downloaded manually by a human from the official release) before this code can produce a real bootable USB drive. Automated tooling did not fetch it.
+This is the raw x64 Secure-Boot-signed UEFI bootloader binary itself — upstream does
+NOT distribute a pre-built disk image. At write time, KangBooting formats the small
+boot partition as FAT (see `Partitioner.CreateUefiNtfsLayoutAsync`) and copies this
+file's contents onto it as `EFI\Boot\bootx64.efi` (see
+`Partitioner.WriteBootloaderImageAsync` / `PlaceBootloader`) — the default path UEFI
+firmware probes when no other boot entry is configured. It is NOT byte-copied onto
+the partition as a raw disk image.

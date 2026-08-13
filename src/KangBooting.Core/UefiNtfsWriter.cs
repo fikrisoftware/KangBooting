@@ -30,7 +30,7 @@ public class UefiNtfsWriter : IWriteEngine
             var (bootPartition, dataPartition) = await _partitioner
                 .CreateUefiNtfsLayoutAsync(target, ct);
 
-            var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "uefi-ntfs.img");
+            var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "bootx64_signed.efi");
             await _partitioner.WriteBootloaderImageAsync(
                 bootPartition, bootloaderImagePath, ct);
 

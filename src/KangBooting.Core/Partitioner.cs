@@ -14,8 +14,9 @@ public class Partitioner : IPartitioner
 {
     private const int SectorSize = 512;
 
-    // UEFI:NTFS boot partition holds only a small FAT-formatted loader image
-    // (assets/uefi-ntfs.img, written verbatim by WriteBootloaderImageAsync).
+    // UEFI:NTFS boot partition is a small FAT12/16-formatted EFI system partition
+    // holding just the bootloader binary at EFI\Boot\bootx64.efi (placed by
+    // WriteBootloaderImageAsync), which chain-loads into the NTFS data partition.
     private const long BootPartitionBytes = 1 * 1024 * 1024;
 
     // 1MiB alignment for the first partition start — standard modern practice
@@ -64,6 +65,12 @@ public class Partitioner : IPartitioner
             bootFirstSector, bootLastSector, BiosPartitionTypes.EfiSystem, markActive: true);
         int dataIndex = table.CreatePrimaryBySector(
             dataFirstSector, dataLastSector, BiosPartitionTypes.Ntfs, markActive: false);
+
+        // DiscUtils' FAT formatter auto-selects FAT12/16 for a partition this small
+        // (~1MiB) - correct and expected for an EFI system partition of this size.
+        // Same FatFileSystem.FormatPartition(disk, index, label) pattern already used
+        // for the Legacy FAT32 partition below.
+        FatFileSystem.FormatPartition(disk, bootIndex, "KANGBOOT");
 
         using (var dataStream = table.Partitions[dataIndex].Open())
         {
@@ -145,14 +152,22 @@ public class Partitioner : IPartitioner
         _ = refreshed;
     }
 
-    public async Task WriteBootloaderImageAsync(
-        PartitionHandle partition, string imagePath, CancellationToken ct = default)
+    public Task WriteBootloaderImageAsync(
+        PartitionHandle partition, string bootloaderPath, CancellationToken ct = default)
     {
-        using var disk = new Disk(partition.DeviceId, FileAccess.ReadWrite);
-        var table = new BiosPartitionTable(disk);
-        using var partitionStream = table.Partitions[partition.PartitionIndex].Open();
-        using var imageStream = File.OpenRead(imagePath);
-        await imageStream.CopyToAsync(partitionStream, ct);
+        using var fat = OpenFat32FileSystem(partition);
+        using var bootloaderStream = File.OpenRead(bootloaderPath);
+        PlaceBootloader(fat, bootloaderStream);
+        return Task.CompletedTask;
+    }
+
+    // Places the EFI bootloader at the fixed path UEFI firmware probes by default
+    // when no other boot entry is configured: EFI\Boot\bootx64.efi.
+    internal static void PlaceBootloader(DiscUtils.IFileSystem fat, Stream bootloaderContent)
+    {
+        fat.CreateDirectory(@"EFI\Boot");
+        using var destStream = fat.OpenFile(@"EFI\Boot\bootx64.efi", FileMode.Create, FileAccess.Write);
+        bootloaderContent.CopyTo(destStream);
     }
 
     // Both Open*FileSystem methods below intentionally leak the underlying `Disk` handle:

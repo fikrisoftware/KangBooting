@@ -16,7 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="..\..\assets\uefi-ntfs.img" Link="assets\uefi-ntfs.img" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\bootx64_signed.efi" Link="assets\bootx64_signed.efi" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
