@@ -1,5 +1,7 @@
 using KangBooting.Core;
+using Microsoft.UI;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using WinRT.Interop;
@@ -21,6 +23,11 @@ public sealed partial class MainWindow : Window
 
         _elapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _elapsedTimer.Tick += (_, _) => ViewModel.RefreshTimeDisplay();
+
+        Title = "KangBooting";
+        var hwnd = WindowNative.GetWindowHandle(this);
+        var windowId = Win32Interop.GetWindowIdFromWindow(hwnd);
+        AppWindow.GetFromWindowId(windowId).SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico"));
 
         var driveService = new DriveService();
         var partitioner = new Partitioner();

@@ -73,25 +73,26 @@ public class FlashViewModel : INotifyPropertyChanged
         : $"Update terakhir: {DateTime.Now:HH:mm:ss}";
 
     public string EtaLabel => CurrentProgress?.EstimatedTimeRemaining is { } eta
-        ? $"Estimasi selesai: {FormatDuration(eta)} lagi"
+        ? $"Estimasi selesai: {TimeFormat.Format(eta)} lagi"
         : "";
 
     private readonly Stopwatch _flashStopwatch = new();
 
     public string ElapsedLabel => _flashStopwatch.IsRunning || _flashStopwatch.Elapsed > TimeSpan.Zero
-        ? $"Berjalan: {FormatDuration(_flashStopwatch.Elapsed)}"
+        ? $"Total waktu: {TimeFormat.Format(_flashStopwatch.Elapsed)}"
         : "";
 
-    // Called on a UI timer (see MainWindow) so Elapsed keeps ticking even during phases
-    // that report no progress events for a while (e.g. dism.exe splitting a large file).
+    // Called on a UI timer (see MainWindow) so Elapsed/per-step duration keep ticking
+    // even during phases that report no progress events for a while (e.g. dism.exe
+    // splitting a large file).
     public void RefreshTimeDisplay()
     {
         OnPropertyChanged(nameof(ElapsedLabel));
+        foreach (var step in Steps)
+        {
+            step.RefreshDuration();
+        }
     }
-
-    private static string FormatDuration(TimeSpan duration) => duration.TotalHours >= 1
-        ? duration.ToString(@"h\:mm\:ss")
-        : duration.ToString(@"m\:ss");
 
     // Fixed checklist mapped to overall percent-complete ranges — deliberately not tied
     // to each IWriteEngine's exact operation-label text, which differs between
