@@ -4,7 +4,6 @@ namespace KangBooting.Core;
 
 public class LegacySplitWriter : IWriteEngine
 {
-    private readonly IDriveService _driveService;
     private readonly IPartitioner _partitioner;
     private readonly IDismRunner _dismRunner;
     private readonly IBootsectRunner _bootsectRunner;
@@ -13,10 +12,9 @@ public class LegacySplitWriter : IWriteEngine
     private const int FourGigabytes = 4000; // MB, matches spec's split threshold
 
     public LegacySplitWriter(
-        IDriveService driveService, IPartitioner partitioner, IDismRunner dismRunner,
+        IPartitioner partitioner, IDismRunner dismRunner,
         IBootsectRunner bootsectRunner, IIsoMounter isoMounter)
     {
-        _driveService = driveService;
         _partitioner = partitioner;
         _dismRunner = dismRunner;
         _bootsectRunner = bootsectRunner;
@@ -31,25 +29,11 @@ public class LegacySplitWriter : IWriteEngine
     {
         progress.Report(new WriteProgress(0, 0, null, "Formatting"));
 
-        PartitionHandle fat32Partition;
-        using (var volumeLock = _driveService.LockVolume(target.DeviceId))
-        {
-            fat32Partition = await _partitioner.CreateLegacyFat32LayoutAsync(target, ct);
-        }
-
-        // Release the raw Disk handle opened during formatting now, before asking
-        // Windows for a drive letter below — holding it open blocks the OS's mount
-        // manager from fully re-enumerating the disk.
-        _partitioner.ReleaseOpenDisks();
-
-        progress.Report(new WriteProgress(10, 0, null, "Menunggu drive letter"));
-        var usbDriveLetter = await DriveLetterResolver.ResolveWithRetryAsync(_driveService, target.DeviceId, fat32Partition.PartitionIndex, ct);
-        if (usbDriveLetter is null)
-        {
-            throw new IOException(
-                "Partisi FAT32 berhasil dibuat tetapi Windows belum memberi drive letter. " +
-                "Coba lepas dan pasang ulang drive USB.");
-        }
+        // Partitioner.CreateLegacyFat32LayoutAsync (native New-Partition/Format-Volume,
+        // not DiscUtils) returns an already-formatted, drive-lettered partition — no
+        // separate volume-lock or drive-letter-polling step needed; the native cmdlets
+        // handle both internally as part of their own job.
+        var usbDriveLetter = await _partitioner.CreateLegacyFat32LayoutAsync(target, ct);
 
         await CopyIsoContentsAsync(isoPath, usbDriveLetter, progress, ct);
 

@@ -19,7 +19,7 @@ public class DriveServiceTests
         Assert.Equal("FAT32", info.CurrentFileSystem);
     }
 
-    // EnumerateUsbDrives() and LockVolume() require real USB hardware and Windows
-    // WMI/kernel access — they are covered by manual hardware testing (see Task 9
-    // of the implementation plan), not by this automated suite.
+    // EnumerateUsbDrives() requires real USB hardware and Windows WMI access — it is
+    // covered by manual hardware testing (see manual-test-checklist-phase1.md), not by
+    // this automated suite.
 }

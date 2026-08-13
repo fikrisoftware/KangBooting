@@ -4,13 +4,11 @@ namespace KangBooting.Core;
 
 public class UefiNtfsWriter : IWriteEngine
 {
-    private readonly IDriveService _driveService;
     private readonly IPartitioner _partitioner;
     private readonly IIsoMounter _isoMounter;
 
-    public UefiNtfsWriter(IDriveService driveService, IPartitioner partitioner, IIsoMounter isoMounter)
+    public UefiNtfsWriter(IPartitioner partitioner, IIsoMounter isoMounter)
     {
-        _driveService = driveService;
         _partitioner = partitioner;
         _isoMounter = isoMounter;
     }
@@ -22,53 +20,44 @@ public class UefiNtfsWriter : IWriteEngine
         CancellationToken ct = default)
     {
         progress.Report(new WriteProgress(0, 0, null, "Formatting"));
+        var (bootDriveLetter, dataDriveLetter) = await _partitioner.CreateUefiNtfsLayoutAsync(target, ct);
 
-        (PartitionHandle bootPartition, PartitionHandle dataPartition) partitions;
-        using (var volumeLock = _driveService.LockVolume(target.DeviceId))
-        {
-            try
-            {
-                partitions = await _partitioner.CreateUefiNtfsLayoutAsync(target, ct);
-
-                var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "bootx64_signed.efi");
-                await _partitioner.WriteBootloaderImageAsync(partitions.bootPartition, bootloaderImagePath, ct);
-            }
-            finally
-            {
-                // An open Disk handle left over from a failed/completed attempt blocks a
-                // subsequent Retry (same process) from reopening the same physical disk —
-                // confirmed on real hardware in the Legacy mode path; fixed here too for
-                // consistency, and so the data-partition drive-letter resolution below
-                // isn't blocked by our own still-open formatting handle.
-                _partitioner.ReleaseOpenDisks();
-            }
-        }
+        progress.Report(new WriteProgress(5, 0, null, "Menulis bootloader"));
+        WriteBootloader(bootDriveLetter);
 
         progress.Report(new WriteProgress(10, 0, null, "Copying files"));
-        await CopyIsoContentsAsync(isoPath, target, partitions.dataPartition, progress, ct);
+        await CopyIsoContentsAsync(isoPath, dataDriveLetter, progress, ct);
 
         progress.Report(new WriteProgress(100, 0, TimeSpan.Zero, "Selesai"));
     }
 
-    // Prefer mounting the ISO via Windows' own UDF/ISO9660 driver (IIsoMounter) over
-    // reading it through DiscUtils (IsoFileSystemOpener) and prefer writing through the
-    // NTFS partition's real Windows-assigned drive letter over DiscUtils' NtfsFileSystem
-    // writer — see LegacySplitWriter's equivalent comment for the specific DiscUtils bugs
-    // (a near-empty UDF disc read via ISO9660 alone; "Invalid path" on valid multi-dot
-    // Windows filenames in its FAT writer) this sidesteps by using the OS's own
-    // filesystem drivers on both ends. Falls back to the DiscUtils-based direct copy only
-    // if native ISO mounting fails, or if the NTFS partition doesn't get a drive letter.
-    private async Task CopyIsoContentsAsync(
-        string isoPath, UsbDriveInfo target, PartitionHandle dataPartition,
-        IProgress<WriteProgress> progress, CancellationToken ct)
+    // Places the EFI bootloader at the fixed path UEFI firmware probes by default when
+    // no other boot entry is configured: EFI\Boot\bootx64.efi. Plain File.Copy onto the
+    // boot partition's real (already-formatted, native-cmdlet-assigned) drive letter —
+    // no DiscUtils FAT writer involved.
+    private static void WriteBootloader(string bootDriveLetter)
     {
-        var dataDriveLetter = await DriveLetterResolver.ResolveWithRetryAsync(
-            _driveService, target.DeviceId, dataPartition.PartitionIndex, ct);
+        var bootloaderSourcePath = Path.Combine(AppContext.BaseDirectory, "assets", "bootx64_signed.efi");
+        var destDir = Path.Combine(bootDriveLetter + @"\", "EFI", "Boot");
+        Directory.CreateDirectory(destDir);
+        File.Copy(bootloaderSourcePath, Path.Combine(destDir, "bootx64.efi"), overwrite: true);
+    }
 
-        var mount = dataDriveLetter is not null ? await TryGetOrMountAsync(isoPath, ct) : null;
+    // Prefer mounting the ISO via Windows' own UDF/ISO9660 driver (IIsoMounter) and
+    // writing through the NTFS partition's real Windows-assigned drive letter — see
+    // Partitioner's class comment for the specific DiscUtils bugs (a near-empty UDF disc
+    // read via ISO9660 alone; "Invalid path" on valid multi-dot Windows filenames;
+    // "Corrupt record" formatting against stale on-disk state) this sidesteps by using
+    // the OS's own drivers throughout. Falls back to DiscUtils only for READING the ISO
+    // if native mounting fails — writing always goes through the real drive letter via
+    // plain System.IO, never DiscUtils' NTFS writer.
+    private async Task CopyIsoContentsAsync(
+        string isoPath, string dataDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
+    {
+        var mount = await TryGetOrMountAsync(isoPath, ct);
         if (mount is null)
         {
-            await CopyViaDiscUtilsAsync(isoPath, dataPartition, progress, ct);
+            CopyViaDiscUtilsFallback(isoPath, dataDriveLetter, progress, ct);
             return;
         }
 
@@ -78,7 +67,7 @@ public class UefiNtfsWriter : IWriteEngine
             var sourceRoot = mountedDriveLetter + @"\";
             var totalBytes = RealFileSystemCopier.ComputeTotalBytes(sourceRoot);
             var tracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 88, "Copying files", totalBytes);
-            RealFileSystemCopier.CopyDirectory(sourceRoot, dataDriveLetter!, tracker, ct);
+            RealFileSystemCopier.CopyDirectory(sourceRoot, dataDriveLetter, tracker, ct);
         }
         finally
         {
@@ -93,7 +82,7 @@ public class UefiNtfsWriter : IWriteEngine
 
     // Checks for an already-mounted instance first (never double-mount the same ISO).
     // Returns null if mounting isn't possible, signalling the caller to fall back to
-    // DiscUtils-based reading/writing.
+    // DiscUtils-based reading.
     private async Task<(string driveLetter, bool weMountedIt)?> TryGetOrMountAsync(string isoPath, CancellationToken ct)
     {
         try
@@ -113,41 +102,30 @@ public class UefiNtfsWriter : IWriteEngine
         }
     }
 
-    // Fallback used if native ISO mounting or drive-letter resolution isn't available:
-    // reads via DiscUtils (UDF-first, ISO9660 fallback) and writes directly through
-    // DiscUtils' raw NTFS partition access (no staging needed — NTFS has no per-file
-    // size limit, unlike LegacySplitWriter's FAT32 case).
-    private async Task CopyViaDiscUtilsAsync(
-        string isoPath, PartitionHandle dataPartition, IProgress<WriteProgress> progress, CancellationToken ct)
+    // Fallback used only if native ISO mounting fails: reads via DiscUtils (UDF-first,
+    // ISO9660 fallback) but still writes via plain System.IO to the real destination
+    // drive letter — DiscUtils is never used to write.
+    private static void CopyViaDiscUtilsFallback(
+        string isoPath, string dataDriveLetter, IProgress<WriteProgress> progress, CancellationToken ct)
     {
         using var isoStream = File.OpenRead(isoPath);
         using var isoFileSystem = IsoFileSystemOpener.Open(isoStream);
 
-        try
-        {
-            using var ntfs = _partitioner.OpenNtfsFileSystem(dataPartition);
-            var totalBytes = ComputeTotalBytes(isoFileSystem);
-            var tracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 88, "Copying files", totalBytes);
-            CopyIsoContentsToFileSystem(isoFileSystem, ntfs, tracker, ct);
-        }
-        finally
-        {
-            _partitioner.ReleaseOpenDisks();
-        }
+        var totalBytes = ComputeTotalBytes(isoFileSystem);
+        var tracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 88, "Copying files", totalBytes);
+        CopyIsoContentsToRealDrive(isoFileSystem, dataDriveLetter, tracker, ct);
     }
 
-    internal static void CopyIsoContentsToFileSystem(
-        IFileSystem source,
-        IFileSystem destination,
-        CopyProgressTracker? tracker = null,
-        CancellationToken ct = default)
+    internal static void CopyIsoContentsToRealDrive(
+        IFileSystem source, string driveLetter, CopyProgressTracker? tracker = null, CancellationToken ct = default)
     {
-        CopyDirectory(source, destination, "", tracker, ct);
+        var destRoot = driveLetter.EndsWith('\\') ? driveLetter : driveLetter + @"\";
+        CopyDirectory(source, destRoot, "", tracker, ct);
     }
 
     private static void CopyDirectory(
         IFileSystem source,
-        IFileSystem destination,
+        string destRoot,
         string path,
         CopyProgressTracker? tracker,
         CancellationToken ct)
@@ -155,8 +133,8 @@ public class UefiNtfsWriter : IWriteEngine
         foreach (var dir in source.GetDirectories(path))
         {
             ct.ThrowIfCancellationRequested();
-            destination.CreateDirectory(dir);
-            CopyDirectory(source, destination, dir, tracker, ct);
+            Directory.CreateDirectory(Path.Combine(destRoot, TrimLeadingSeparator(dir)));
+            CopyDirectory(source, destRoot, dir, tracker, ct);
         }
 
         foreach (var file in source.GetFiles(path))
@@ -166,13 +144,15 @@ public class UefiNtfsWriter : IWriteEngine
             // ISO9660 (non-Joliet-resolved) names carry a ";<version>" suffix
             // (e.g. "install.wim;1") that must be stripped for the destination
             // file system, which has no concept of file versions.
-            var destPath = StripIsoVersionSuffix(file);
+            var destPath = Path.Combine(destRoot, TrimLeadingSeparator(StripIsoVersionSuffix(file)));
 
             using var sourceStream = source.OpenFile(file, FileMode.Open);
-            using var destStream = destination.OpenFile(destPath, FileMode.Create, FileAccess.Write);
+            using var destStream = File.Create(destPath);
             CopyProgressTracker.CopyStreamWithProgress(sourceStream, destStream, tracker, ct);
         }
     }
+
+    private static string TrimLeadingSeparator(string path) => path.TrimStart('\\', '/');
 
     private static long ComputeTotalBytes(IFileSystem source, string path = "")
     {

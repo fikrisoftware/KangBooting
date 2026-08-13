@@ -1,6 +1,4 @@
-using DiscUtils.Ntfs;
 using DiscUtils.Iso9660;
-using DiscUtils.Streams;
 using KangBooting.Core;
 using Xunit;
 
@@ -29,24 +27,30 @@ public class UefiNtfsWriterTests : IDisposable
     }
 
     [Fact]
-    public void CopyIsoContentsToNtfs_PreservesLargeFileWithoutSplitting()
+    public void CopyIsoContentsToRealDrive_PreservesLargeFileWithoutSplitting()
     {
         // Arrange: an ISO with a file bigger than the FAT32 4GB limit would allow,
-        // written to an in-memory NTFS volume to prove NTFS handles it as one file.
+        // copied to a real (temp) directory to prove no size limit applies here (NTFS
+        // has no such limit, and this is the same plain-System.IO write path used
+        // against a real drive letter).
         var isoPath = BuildIsoWithFile(@"sources\install.wim", sizeMb: 10);
+        var destDir = Directory.CreateTempSubdirectory("kangbooting-uefi-dest").FullName;
+        try
+        {
+            using var isoStream = File.OpenRead(isoPath);
+            using var cdReader = new CDReader(isoStream, joliet: true);
 
-        using var isoStream = File.OpenRead(isoPath);
-        using var cdReader = new CDReader(isoStream, joliet: true);
+            // Act
+            UefiNtfsWriter.CopyIsoContentsToRealDrive(cdReader, destDir);
 
-        var ntfsStream = new SparseMemoryStream();
-        NtfsFileSystem.Format(ntfsStream, "TESTVOL", new DiscUtils.Geometry(1, 1, 1), 0, 200 * 1024 * 1024 / 512);
-        using var ntfs = new NtfsFileSystem(ntfsStream);
-
-        // Act
-        UefiNtfsWriter.CopyIsoContentsToFileSystem(cdReader, ntfs);
-
-        // Assert: the file exists on the NTFS volume as a single, unsplit file.
-        Assert.True(ntfs.FileExists(@"sources\install.wim"));
-        Assert.Equal(10 * 1024 * 1024, ntfs.GetFileLength(@"sources\install.wim"));
+            // Assert: the file exists at the destination as a single, unsplit file.
+            var destFile = Path.Combine(destDir, "sources", "install.wim");
+            Assert.True(File.Exists(destFile));
+            Assert.Equal(10 * 1024 * 1024, new FileInfo(destFile).Length);
+        }
+        finally
+        {
+            Directory.Delete(destDir, recursive: true);
+        }
     }
 }

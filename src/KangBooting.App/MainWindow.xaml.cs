@@ -41,8 +41,8 @@ public sealed partial class MainWindow : Window
             checksumService: new ChecksumService(),
             prerequisiteChecker: new PrerequisiteChecker(),
             writeEngineFactory: mode => mode == BootMode.UefiNtfs
-                ? new UefiNtfsWriter(driveService, partitioner, isoMounter)
-                : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner, isoMounter));
+                ? new UefiNtfsWriter(partitioner, isoMounter)
+                : new LegacySplitWriter(partitioner, dismRunner, bootsectRunner, isoMounter));
 
         try
         {

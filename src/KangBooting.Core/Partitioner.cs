@@ -1,271 +1,135 @@
-using DiscUtils.Fat;
-using DiscUtils.Ntfs;
-using DiscUtils.Partitions;
-using DiscUtils.Raw;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace KangBooting.Core;
 
-// ponytail: implemented directly against the real DiscUtils 0.16.13 API (verified by
-// spiking against throwaway VHD-backed disks) rather than the plan's brief pseudocode,
-// which assumed methods (CreateWholeDiskPartition, PartitionInfo.SetActive(),
-// NtfsFileSystem.Format(stream,label)) that do not exist in the installed package.
-// See task-8-report.md for the full trail of what was verified and why.
+// Root-cause pivot after repeated real-hardware failures: DiscUtils' own partition-table
+// writer and FAT/NTFS formatters were the source of three separate real-hardware bugs —
+// FatFileSystem.FormatPartition rejecting a 1MiB boot partition as "too small",
+// NtfsFileSystem.Format throwing "Corrupt record" against stale on-disk state left by a
+// previous DiscUtils-written layout, and needing to reverse-engineer the correct MBR
+// partition-type byte from Rufus's source in the first place. Windows' own Storage
+// module cmdlets (New-Partition/Format-Volume) are what Windows Setup and diskpart
+// themselves use to partition/format disks, and — shelled out to via powershell.exe,
+// the same reliable pattern already used by IsoMounter/DismRunner/BootsectRunner — have
+// shown none of these issues. Partitioning, formatting, and drive-letter assignment are
+// all done natively now; DiscUtils remains only for the ISO-reading fallback
+// (IsoFileSystemOpener), a lower-risk read-only concern that hasn't had a real-hardware
+// bug. This also eliminates the previous FSCTL_LOCK_VOLUME/drive-letter-polling dance
+// (DriveService.LockVolume, DriveLetterResolver) entirely: New-Partition/Format-Volume
+// are synchronous and handle volume locking and drive-letter assignment internally as
+// part of their own job, so callers get a ready-to-use drive letter the moment the
+// PowerShell call returns.
 public class Partitioner : IPartitioner
 {
-    private const int SectorSize = 512;
+    private const int BootPartitionMB = 16;
 
-    // UEFI:NTFS boot partition is a small FAT12/16-formatted EFI system partition
-    // holding just the bootloader binary at EFI\Boot\bootx64.efi (placed by
-    // WriteBootloaderImageAsync), which chain-loads into the NTFS data partition.
-    // Root-cause fix (confirmed on real hardware + reproduced via a throwaway probe):
-    // 1MiB was too small for DiscUtils' FatFileSystem.FormatPartition(disk, index,
-    // label) convenience overload, which threw ArgumentException("Requested size is
-    // too small for a partition") — the on-disk partition was created (correct size)
-    // but left unformatted ("Unknown" filesystem type in Windows) because formatting
-    // failed right after. Probed 1/2/4/8/16/32 MiB against the real DiscUtils 0.16.13
-    // FAT formatter: 1/2/4 MiB fail, 8 MiB is the minimum that succeeds. 16 MiB gives
-    // headroom above that measured threshold — still negligible relative to any USB
-    // drive's capacity.
-    internal const long BootPartitionBytes = 16 * 1024 * 1024;
-
-    // 1MiB alignment for the first partition start — standard modern practice
-    // (matches Windows/diskpart/GPT default alignment), avoids relying on the
-    // library's CHS/cylinder rounding for such a small partition.
-    private const long AlignmentSectors = 2048;
-
-    // Root-cause fix (confirmed on real hardware): Open*FileSystem previously left the
-    // backing Disk device handle open with no way to close it (see the comment above
-    // those methods for why). This was flagged as a known limitation, then reproduced
-    // live: clicking "Coba Lagi" (Retry) within the same running process failed with
-    // "The process cannot access the file '\\.\PHYSICALDRIVEn' because it is being
-    // used by another process" — the FIRST attempt's leaked Disk handle was still open,
-    // blocking the retry's own attempt to open the same physical disk. Tracking every
-    // opened Disk here and releasing them via ReleaseOpenDisks() (called from each
-    // IWriteEngine's finally block) closes that gap without changing IPartitioner's
-    // Open*FileSystem return types.
-    private readonly List<Disk> _openDisks = new();
-
-    public void ReleaseOpenDisks()
-    {
-        foreach (var disk in _openDisks)
-        {
-            disk.Dispose();
-        }
-
-        _openDisks.Clear();
-    }
-
-    public Task<(PartitionHandle bootPartition, PartitionHandle dataPartition)> CreateUefiNtfsLayoutAsync(
+    public async Task<(string bootDriveLetter, string dataDriveLetter)> CreateUefiNtfsLayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
-        var result = CreateUefiNtfsLayout(target);
-        RefreshPartitionTable(target.DeviceId);
-        return Task.FromResult(result);
+        var diskNumber = ExtractDiskNumber(target.DeviceId);
+        var script = BuildUefiNtfsLayoutScript(diskNumber, BootPartitionMB);
+        var output = await RunPowerShellAsync(script, ct);
+        var letters = ParseDriveLetters(output, expectedCount: 2);
+        return (letters[0], letters[1]);
     }
 
-    private (PartitionHandle bootPartition, PartitionHandle dataPartition) CreateUefiNtfsLayout(UsbDriveInfo target)
-    {
-        using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
-
-        // User-reported real-hardware bug: "Corrupt record" from NtfsFileSystem.Format
-        // on a drive that had already been repartitioned several times in this same
-        // session (Legacy full-disk FAT32, then a failed UEFI attempt at a different
-        // boot-partition size). BiosPartitionTable.Initialize only overwrites the MBR's
-        // partition table entries — it does not zero the disk, so stale boot
-        // sectors/NTFS metadata from a PREVIOUS layout (at different partition
-        // boundaries) can remain on disk and confuse a fresh format. Reproducing this
-        // exact call sequence against a pristine in-memory disk of the same size did
-        // NOT reproduce the error, pointing at leftover on-disk state rather than the
-        // partitioning math. Zeroing the regions where boot sectors/filesystem metadata
-        // conventionally live (start and end of the disk) before creating new
-        // partitions removes that ambiguity without the cost of wiping the whole drive.
-        CleanDiskHeaderAndFooter(disk);
-
-        // Initialize(disk) alone writes an empty MBR with zero partitions.
-        // (Initialize(disk, WellKnownPartitionType) would immediately consume the
-        // whole disk with one partition, leaving no room for a second.)
-        var table = BiosPartitionTable.Initialize(disk);
-
-        long totalSectors = disk.Capacity / SectorSize;
-        long bootSectorCount = BootPartitionBytes / SectorSize;
-
-        long bootFirstSector = AlignmentSectors;
-        long bootLastSector = bootFirstSector + bootSectorCount - 1;
-        long dataFirstSector = bootLastSector + 1;
-        long dataLastSector = totalSectors - 1;
-
-        // CreatePrimaryBySector places partitions at exact LBAs, sidestepping
-        // BiosPartitionTable.Create(size,...)'s cylinder rounding (which, for large
-        // disks with large BIOS-translated cylinders, rounds a 1MiB request down to
-        // zero cylinders and throws).
-        //
-        // Boot partition type: verified against pbatard/rufus (the reference
-        // implementation of this exact UEFI:NTFS technique) - src/drive.c sets
-        // `DriveLayoutEx.PartitionEntry[i].Mbr.PartitionType = 0xef` for the
-        // "UEFI:NTFS" partition even in MBR (non-GPT) mode, with a comment noting
-        // they picked EFI System (0xEF) over classic FAT types and it "seems to be
-        // okay". DiscUtils exposes this exact byte as BiosPartitionTypes.EfiSystem
-        // (0xEF), used here instead of a classic FAT16/FAT12 type byte.
-        int bootIndex = table.CreatePrimaryBySector(
-            bootFirstSector, bootLastSector, BiosPartitionTypes.EfiSystem, markActive: true);
-        int dataIndex = table.CreatePrimaryBySector(
-            dataFirstSector, dataLastSector, BiosPartitionTypes.Ntfs, markActive: false);
-
-        // DiscUtils' FAT formatter auto-selects FAT12/16 for a partition this small
-        // (~1MiB) - correct and expected for an EFI system partition of this size.
-        // Same FatFileSystem.FormatPartition(disk, index, label) pattern already used
-        // for the Legacy FAT32 partition below.
-        FatFileSystem.FormatPartition(disk, bootIndex, "KANGBOOT");
-
-        using (var dataStream = table.Partitions[dataIndex].Open())
-        {
-            // firstSector must be the partition's ABSOLUTE start sector on the physical
-            // disk, not an offset into this partition-scoped stream. Verified against
-            // DiscUtils source (NtfsFileSystem.Format -> NtfsFormatter.FirstSector ->
-            // BiosParameterBlock.Initialized(..., (uint)FirstSector, ...)), which feeds
-            // straight into the boot sector's BPB HiddenSectors field - the standard
-            // NTFS/FAT convention for recording a volume's absolute LBA start so
-            // bootloaders/tools can locate it from the volume alone.
-            NtfsFileSystem.Format(dataStream, "KANGBOOT", disk.Geometry, dataFirstSector, dataStream.Length / SectorSize);
-        }
-
-        return (
-            new PartitionHandle(target.DeviceId, bootIndex),
-            new PartitionHandle(target.DeviceId, dataIndex));
-    }
-
-    public Task<PartitionHandle> CreateLegacyFat32LayoutAsync(
+    public async Task<string> CreateLegacyFat32LayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
-        var result = CreateLegacyFat32Layout(target);
-        RefreshPartitionTable(target.DeviceId);
-        return Task.FromResult(result);
+        var diskNumber = ExtractDiskNumber(target.DeviceId);
+        var script = BuildLegacyFat32LayoutScript(diskNumber);
+        var output = await RunPowerShellAsync(script, ct);
+        var letters = ParseDriveLetters(output, expectedCount: 1);
+        return letters[0];
     }
 
-    private PartitionHandle CreateLegacyFat32Layout(UsbDriveInfo target)
+    internal static int ExtractDiskNumber(string deviceId)
     {
-        using var disk = new Disk(target.DeviceId, FileAccess.ReadWrite);
-
-        // See CreateUefiNtfsLayout's comment: clears stale boot sectors/filesystem
-        // metadata from a previous layout before creating a fresh one.
-        CleanDiskHeaderAndFooter(disk);
-
-        // Initialize(disk, type) creates a single partition spanning the entire disk
-        // and already marks it active — no separate SetActive step needed/available.
-        var table = BiosPartitionTable.Initialize(disk, WellKnownPartitionType.WindowsFat);
-        const int index = 0;
-
-        // Explicit insurance: Initialize(disk, type) is documented/observed to mark the
-        // sole partition active as a side effect, but that behavior isn't asserted by
-        // the library's public contract. This call is harmless if already active and
-        // removes the risk entirely if the side effect ever changes or was wrong.
-        table.SetActivePartition(index);
-
-        FatFileSystem.FormatPartition(disk, index, "KANGBOOT");
-
-        return new PartitionHandle(target.DeviceId, index);
-    }
-
-    // Zeroes the regions where partition tables, boot sectors, and filesystem metadata
-    // (MBR/GPT headers, NTFS boot sector + its backup at the volume's last sector, FAT
-    // BPB, etc.) conventionally live, so a fresh format never has to contend with
-    // leftover bytes from whatever was on this disk before. Bounded to a small region at
-    // each end (not the whole disk) - this only needs to outrun the largest boot
-    // partition size we've ever used (BootPartitionBytes) plus alignment, not wipe
-    // multi-GB user data.
-    private static void CleanDiskHeaderAndFooter(Disk disk)
-    {
-        const long headerBytes = BootPartitionBytes + (4 * 1024 * 1024); // + alignment/MBR margin
-        const long footerBytes = 4 * 1024 * 1024; // NTFS backup boot sector, GPT backup header, etc.
-
-        var zeroChunk = new byte[1024 * 1024];
-
-        disk.Content.Position = 0;
-        for (long written = 0; written < headerBytes; written += zeroChunk.Length)
+        // deviceId looks like "\\.\PHYSICALDRIVE1".
+        var match = Regex.Match(deviceId, @"PHYSICALDRIVE(\d+)", RegexOptions.IgnoreCase);
+        if (!match.Success)
         {
-            disk.Content.Write(zeroChunk, 0, zeroChunk.Length);
+            throw new ArgumentException($"Tidak bisa menentukan nomor disk dari '{deviceId}'.");
         }
 
-        var footerStart = Math.Max(0, disk.Capacity - footerBytes);
-        disk.Content.Position = footerStart;
-        for (long written = footerStart; written < disk.Capacity; written += zeroChunk.Length)
+        return int.Parse(match.Groups[1].Value);
+    }
+
+    // Single-quoted PowerShell strings throughout (no embedded double quotes) so the
+    // whole script can be wrapped in double quotes as one process argument without
+    // needing to escape anything inside it.
+    internal static string BuildUefiNtfsLayoutScript(int diskNumber, int bootPartitionMB) =>
+        $"$ErrorActionPreference = 'Stop'; " +
+        $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
+        $"Initialize-Disk -Number {diskNumber} -PartitionStyle MBR -Confirm:$false; " +
+        $"$boot = New-Partition -DiskNumber {diskNumber} -Size {bootPartitionMB}MB -MbrType EFI -IsActive -AssignDriveLetter; " +
+        $"Format-Volume -Partition $boot -FileSystem FAT -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
+        $"$data = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -AssignDriveLetter; " +
+        $"Format-Volume -Partition $data -FileSystem NTFS -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
+        $"'{{0}}:|{{1}}:' -f $boot.DriveLetter, $data.DriveLetter";
+
+    internal static string BuildLegacyFat32LayoutScript(int diskNumber) =>
+        $"$ErrorActionPreference = 'Stop'; " +
+        $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
+        $"Initialize-Disk -Number {diskNumber} -PartitionStyle MBR -Confirm:$false; " +
+        $"$part = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -MbrType FAT32 -IsActive -AssignDriveLetter; " +
+        $"Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
+        $"'{{0}}:' -f $part.DriveLetter";
+
+    internal static IReadOnlyList<string> ParseDriveLetters(string output, int expectedCount)
+    {
+        var line = output
+            .Split('\n')
+            .Select(l => l.Trim())
+            .LastOrDefault(l => !string.IsNullOrWhiteSpace(l));
+
+        if (string.IsNullOrEmpty(line))
         {
-            var remaining = disk.Capacity - written;
-            disk.Content.Write(zeroChunk, 0, (int)Math.Min(zeroChunk.Length, remaining));
+            throw new IOException("Tidak mendapat drive letter dari proses partisi/format.");
         }
-    }
 
-    // I2 fix: after DiscUtils writes a new partition table directly to the raw disk,
-    // Windows' own view of the disk (and any drive-letter/volume assignment downstream
-    // code depends on, e.g. DriveService.GetDriveLetterForPartition) is stale until it
-    // re-reads the partition table. IOCTL_DISK_UPDATE_PROPERTIES forces that re-read.
-    // Untested on real hardware — see manual-test-checklist-phase1.md.
-    private static void RefreshPartitionTable(string deviceId)
-    {
-        using var handle = NativeMethods.CreateFile(
-            deviceId,
-            NativeMethods.GENERIC_READ | NativeMethods.GENERIC_WRITE,
-            NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE,
-            IntPtr.Zero,
-            NativeMethods.OPEN_EXISTING,
-            0,
-            IntPtr.Zero);
-
-        if (handle.IsInvalid)
+        var letters = line.Split('|');
+        if (letters.Length != expectedCount || letters.Any(l => l.Length < 2 || !char.IsLetter(l[0]) || l[^1] != ':'))
         {
-            // Best-effort: if we can't even open the disk here, downstream code
-            // (drive-letter resolution, next write) will surface a clearer error.
-            return;
+            throw new IOException($"Format drive letter tidak dikenali: '{line}'.");
         }
 
-        // Capture (rather than discard) the result: a failed refresh isn't fatal on its
-        // own — Windows may still pick up the new partition table another way — but if
-        // it fails, the drive-letter retry loop in LegacySplitWriter that runs right
-        // after this is far more likely to time out, and that's the first place a user
-        // sees an error. No logging framework here, so this is a one-line note rather
-        // than threading the flag through the frozen IPartitioner return types.
-        bool refreshed = NativeMethods.DeviceIoControl(
-            handle, NativeMethods.IOCTL_DISK_UPDATE_PROPERTIES,
-            IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
-        _ = refreshed;
+        return letters;
     }
 
-    public Task WriteBootloaderImageAsync(
-        PartitionHandle partition, string bootloaderPath, CancellationToken ct = default)
+    private static async Task<string> RunPowerShellAsync(string script, CancellationToken ct)
     {
-        using var fat = OpenFat32FileSystem(partition);
-        using var bootloaderStream = File.OpenRead(bootloaderPath);
-        PlaceBootloader(fat, bootloaderStream);
-        return Task.CompletedTask;
-    }
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -NonInteractive -Command \"{script.Replace("\"", "\\\"")}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
 
-    // Places the EFI bootloader at the fixed path UEFI firmware probes by default
-    // when no other boot entry is configured: EFI\Boot\bootx64.efi.
-    internal static void PlaceBootloader(DiscUtils.IFileSystem fat, Stream bootloaderContent)
-    {
-        fat.CreateDirectory(@"EFI\Boot");
-        using var destStream = fat.OpenFile(@"EFI\Boot\bootx64.efi", FileMode.Create, FileAccess.Write);
-        bootloaderContent.CopyTo(destStream);
-    }
+        using var process = Process.Start(startInfo)
+            ?? throw new IOException("Gagal menjalankan powershell.exe untuk partisi/format drive.");
 
-    // Both Open*FileSystem methods return a bare NtfsFileSystem/FatFileSystem (per the
-    // IPartitioner contract) with no hook for the caller to dispose the Disk backing its
-    // stream. Rather than leak it, the Disk is tracked in _openDisks and released via
-    // ReleaseOpenDisks() (called from each IWriteEngine's finally block) once the
-    // returned filesystem is no longer needed.
-    public NtfsFileSystem OpenNtfsFileSystem(PartitionHandle partition)
-    {
-        var disk = new Disk(partition.DeviceId, FileAccess.ReadWrite);
-        _openDisks.Add(disk);
-        var table = new BiosPartitionTable(disk);
-        return new NtfsFileSystem(table.Partitions[partition.PartitionIndex].Open());
-    }
+        // Drain both streams concurrently — see DismRunner/BootsectRunner for why
+        // sequential reads risk a pipe-buffer deadlock.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+        await Task.WhenAll(stdoutTask, stderrTask);
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
 
-    public FatFileSystem OpenFat32FileSystem(PartitionHandle partition)
-    {
-        var disk = new Disk(partition.DeviceId, FileAccess.ReadWrite);
-        _openDisks.Add(disk);
-        var table = new BiosPartitionTable(disk);
-        return new FatFileSystem(table.Partitions[partition.PartitionIndex].Open());
+        await process.WaitForExitAsync(ct);
+
+        if (process.ExitCode != 0)
+        {
+            throw new IOException(
+                $"Gagal partisi/format drive (exit code {process.ExitCode}): " +
+                (string.IsNullOrWhiteSpace(stderr) ? "Tidak ada detail error." : stderr.Trim()));
+        }
+
+        return stdout;
     }
 }

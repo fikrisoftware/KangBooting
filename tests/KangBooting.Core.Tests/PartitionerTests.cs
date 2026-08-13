@@ -1,8 +1,3 @@
-using System.Text;
-using DiscUtils.Fat;
-using DiscUtils.Partitions;
-using DiscUtils.Raw;
-using DiscUtils.Streams;
 using KangBooting.Core;
 using Xunit;
 
@@ -10,54 +5,91 @@ namespace KangBooting.Core.Tests;
 
 public class PartitionerTests
 {
-    // Regression test for a real-hardware bug: BootPartitionBytes was 1MiB, which
-    // DiscUtils' FatFileSystem.FormatPartition(disk, index, label) convenience overload
-    // rejects with ArgumentException("Requested size is too small for a partition") -
-    // the partition got created on disk but was left unformatted, surfacing to the user
-    // as "Requested size is too small for a partition" and an "Unknown" filesystem type
-    // in Windows. This exercises the exact same call path (BiosPartitionTable +
-    // FormatPartition(disk, index, label)) at the real production constant, against an
-    // in-memory Disk, so a future size regression fails a unit test instead of only
-    // surfacing on real hardware.
-    [Fact]
-    public void BootPartitionBytes_IsLargeEnoughToFormat()
+    [Theory]
+    [InlineData(@"\\.\PHYSICALDRIVE1", 1)]
+    [InlineData(@"\\.\PHYSICALDRIVE0", 0)]
+    [InlineData(@"\\.\PHYSICALDRIVE12", 12)]
+    public void ExtractDiskNumber_ParsesPhysicalDrivePath(string deviceId, int expected)
     {
-        var totalBytes = Partitioner.BootPartitionBytes + (4 * 1024 * 1024); // + MBR/alignment overhead
-        var stream = new SparseMemoryStream();
-        stream.SetLength(totalBytes);
-        using var disk = new Disk(stream, Ownership.Dispose);
-
-        var table = BiosPartitionTable.Initialize(disk);
-        long bootSectorCount = Partitioner.BootPartitionBytes / 512;
-        const long bootFirstSector = 2048;
-        long bootLastSector = bootFirstSector + bootSectorCount - 1;
-
-        int bootIndex = table.CreatePrimaryBySector(
-            bootFirstSector, bootLastSector, BiosPartitionTypes.EfiSystem, markActive: true);
-
-        // Should not throw. Prior to the fix, this line threw
-        // ArgumentException("Requested size is too small for a partition") at 1MiB.
-        FatFileSystem.FormatPartition(disk, bootIndex, "KANGBOOT");
+        Assert.Equal(expected, Partitioner.ExtractDiskNumber(deviceId));
     }
 
     [Fact]
-    public void PlaceBootloader_WritesFileAtEfiBootPath()
+    public void ExtractDiskNumber_InvalidFormat_Throws()
     {
-        // Arrange: a small in-memory FAT filesystem, standing in for the formatted
-        // UEFI:NTFS boot partition, and a fake bootloader binary's bytes.
-        var fatStream = new SparseMemoryStream();
-        FatFileSystem.FormatPartition(fatStream, "KANGBOOT", new DiscUtils.Geometry(1, 1, 1), 0, 8 * 1024 * 1024 / 512, 1);
-        using var fat = new FatFileSystem(fatStream);
+        Assert.Throws<ArgumentException>(() => Partitioner.ExtractDiskNumber(@"C:\not-a-physical-drive"));
+    }
 
-        var bootloaderBytes = Encoding.ASCII.GetBytes("fake uefi bootloader content");
+    [Fact]
+    public void BuildUefiNtfsLayoutScript_ContainsExpectedCmdletsAndDiskNumber()
+    {
+        var script = Partitioner.BuildUefiNtfsLayoutScript(diskNumber: 2, bootPartitionMB: 16);
 
-        // Act
-        Partitioner.PlaceBootloader(fat, new MemoryStream(bootloaderBytes));
+        Assert.Contains("Clear-Disk -Number 2", script);
+        Assert.Contains("Initialize-Disk -Number 2 -PartitionStyle MBR", script);
+        Assert.Contains("New-Partition -DiskNumber 2 -Size 16MB -MbrType EFI -IsActive -AssignDriveLetter", script);
+        Assert.Contains("Format-Volume -Partition $boot -FileSystem FAT", script);
+        Assert.Contains("New-Partition -DiskNumber 2 -UseMaximumSize -AssignDriveLetter", script);
+        Assert.Contains("Format-Volume -Partition $data -FileSystem NTFS", script);
+        Assert.DoesNotContain("\"", script); // no embedded double quotes — see class comment on escaping
+    }
 
-        // Assert: content lands at the fixed default UEFI probe path.
-        Assert.True(fat.FileExists(@"EFI\Boot\bootx64.efi"));
-        using var written = fat.OpenFile(@"EFI\Boot\bootx64.efi", FileMode.Open, FileAccess.Read);
-        using var reader = new StreamReader(written);
-        Assert.Equal("fake uefi bootloader content", reader.ReadToEnd());
+    [Fact]
+    public void BuildLegacyFat32LayoutScript_ContainsExpectedCmdletsAndDiskNumber()
+    {
+        var script = Partitioner.BuildLegacyFat32LayoutScript(diskNumber: 3);
+
+        Assert.Contains("Clear-Disk -Number 3", script);
+        Assert.Contains("Initialize-Disk -Number 3 -PartitionStyle MBR", script);
+        Assert.Contains("New-Partition -DiskNumber 3 -UseMaximumSize -MbrType FAT32 -IsActive -AssignDriveLetter", script);
+        Assert.Contains("Format-Volume -Partition $part -FileSystem FAT32", script);
+        Assert.DoesNotContain("\"", script);
+    }
+
+    [Fact]
+    public void ParseDriveLetters_TwoLetters_ParsesCorrectly()
+    {
+        var letters = Partitioner.ParseDriveLetters("E:|F:", expectedCount: 2);
+
+        Assert.Equal(new[] { "E:", "F:" }, letters);
+    }
+
+    [Fact]
+    public void ParseDriveLetters_OneLetter_ParsesCorrectly()
+    {
+        var letters = Partitioner.ParseDriveLetters("G:", expectedCount: 1);
+
+        Assert.Equal(new[] { "G:" }, letters);
+    }
+
+    [Fact]
+    public void ParseDriveLetters_UsesLastNonEmptyLine_IgnoringNoise()
+    {
+        // PowerShell output can carry leading blank lines/whitespace from cmdlet
+        // pipelines that don't suppress all output — only the last non-empty line
+        // (our own explicit format-string output) should be parsed.
+        var output = "\nSome informational noise\n\nE:|F:\n";
+
+        var letters = Partitioner.ParseDriveLetters(output, expectedCount: 2);
+
+        Assert.Equal(new[] { "E:", "F:" }, letters);
+    }
+
+    [Fact]
+    public void ParseDriveLetters_EmptyOutput_Throws()
+    {
+        Assert.Throws<IOException>(() => Partitioner.ParseDriveLetters("   \n  \n", expectedCount: 1));
+    }
+
+    [Fact]
+    public void ParseDriveLetters_WrongCount_Throws()
+    {
+        Assert.Throws<IOException>(() => Partitioner.ParseDriveLetters("E:|F:", expectedCount: 1));
+    }
+
+    [Fact]
+    public void ParseDriveLetters_MalformedLetter_Throws()
+    {
+        Assert.Throws<IOException>(() => Partitioner.ParseDriveLetters("not-a-letter", expectedCount: 1));
     }
 }
