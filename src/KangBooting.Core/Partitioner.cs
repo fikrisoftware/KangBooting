@@ -42,21 +42,25 @@ public class Partitioner : IPartitioner
         var (bootPartitionNumber, bootDriveLetter) = await CreatePartitionOnlyAsync(
             diskNumber, sizeMB: BootPartitionMB, isActive: true, ct);
 
-        // Real-hardware root cause: Windows' Format-Volume cmdlet (and Disk Management's
-        // GUI formatter) refuses to create an NTFS volume on media Windows classifies as
-        // "Removable" (most USB flash drives) — this is a genuine, longstanding Windows
-        // restriction, not a caching/timing issue ("Update-Disk" was tried first and did
-        // NOT fix it — same "Format-Volume : Not Supported" error reproduced identically
-        // afterward). diskpart's own `format` command is not subject to this restriction,
-        // so both the MBR type-byte patch AND the actual format are done via diskpart for
-        // every partition here; PowerShell is used only for New-Partition (disk-level ops,
-        // partition creation, and drive-letter assignment, which all worked fine).
-        await FormatPartitionViaDiskpartAsync(diskNumber, bootPartitionNumber, "fat", EfiSystemMbrTypeHex, ct);
+        await SetPartitionTypeAsync(diskNumber, bootPartitionNumber, EfiSystemMbrTypeHex, ct);
 
-        var (dataPartitionNumber, dataDriveLetter) = await CreatePartitionOnlyAsync(
+        // Real-hardware finding: Windows' Format-Volume cmdlet refuses NTFS on removable
+        // media ("Not Supported"). diskpart's `format` command was tried next and turned
+        // out to be MORE restrictive, not less — it refused to format ANY filesystem
+        // (including FAT) on this removable disk ("The operation is not supported on
+        // removable media"), even though Format-Volume had formatted the boot partition's
+        // FAT filesystem just fine. So this restriction is specific to diskpart's and
+        // Format-Volume's own VDS-backed code paths, not universal — confirmed on real
+        // hardware that the classic command-line format.exe (`format X: /FS:NTFS /Q`)
+        // succeeds on the same removable disk where both of those failed. format.exe is
+        // now used for all actual formatting; diskpart is used only for the boot
+        // partition's MBR type-byte patch (`set id=`), which it has always handled fine.
+        await FormatWithFormatExeAsync(bootDriveLetter, "FAT", ct);
+
+        var (_, dataDriveLetter) = await CreatePartitionOnlyAsync(
             diskNumber, sizeMB: null, isActive: false, ct);
 
-        await FormatPartitionViaDiskpartAsync(diskNumber, dataPartitionNumber, "ntfs", mbrTypeHex: null, ct);
+        await FormatWithFormatExeAsync(dataDriveLetter, "NTFS", ct);
 
         return (bootDriveLetter, dataDriveLetter);
     }
@@ -68,10 +72,10 @@ public class Partitioner : IPartitioner
 
         await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
 
-        var (partitionNumber, driveLetter) = await CreatePartitionOnlyAsync(
+        var (_, driveLetter) = await CreatePartitionOnlyAsync(
             diskNumber, sizeMB: null, isActive: true, ct);
 
-        await FormatPartitionViaDiskpartAsync(diskNumber, partitionNumber, "fat32", mbrTypeHex: null, ct);
+        await FormatWithFormatExeAsync(driveLetter, "FAT32", ct);
 
         return driveLetter;
     }
@@ -145,33 +149,36 @@ public class Partitioner : IPartitioner
         return ParsePartitionResult(output);
     }
 
-    // mbrTypeHex is only needed for the UEFI:NTFS boot partition (0xEF); null skips it.
-    // The `set id=` line must come before `format` in the same diskpart invocation.
-    internal static string BuildFormatPartitionDiskpartScript(
-        int diskNumber, int partitionNumber, string fileSystem, string? mbrTypeHex)
-    {
-        var setIdLine = mbrTypeHex is null ? "" : $"set id={mbrTypeHex} override\r\n";
-        return $"select disk {diskNumber}\r\n" +
-            $"select partition {partitionNumber}\r\n" +
-            setIdLine +
-            $"format fs={fileSystem} quick label=\"KANGBOOT\"\r\n";
-    }
+    internal static string BuildSetPartitionTypeDiskpartScript(int diskNumber, int partitionNumber, string mbrTypeHex) =>
+        $"select disk {diskNumber}\r\n" +
+        $"select partition {partitionNumber}\r\n" +
+        $"set id={mbrTypeHex} override\r\n";
 
-    private static async Task FormatPartitionViaDiskpartAsync(
-        int diskNumber, int partitionNumber, string fileSystem, string? mbrTypeHex, CancellationToken ct)
+    private static async Task SetPartitionTypeAsync(int diskNumber, int partitionNumber, string mbrTypeHex, CancellationToken ct)
     {
         var scriptPath = Path.Combine(Path.GetTempPath(), $"kangbooting-diskpart-{Guid.NewGuid():N}.txt");
-        await File.WriteAllTextAsync(scriptPath, BuildFormatPartitionDiskpartScript(diskNumber, partitionNumber, fileSystem, mbrTypeHex), ct);
+        await File.WriteAllTextAsync(scriptPath, BuildSetPartitionTypeDiskpartScript(diskNumber, partitionNumber, mbrTypeHex), ct);
         try
         {
             await RunProcessAsync("diskpart.exe", $"/s \"{scriptPath}\"", ct,
-                errorPrefix: "Gagal format partisi");
+                errorPrefix: "Gagal mengatur tipe partisi boot");
         }
         finally
         {
             File.Delete(scriptPath);
         }
     }
+
+    // format.com has no command-line flag to auto-confirm — it prompts on stdin
+    // ("Proceed with Format (Y/N)?" and, if the volume already carries a label, "Enter
+    // current volume label for drive X:"). Answering blind with several "Y\r\n" lines
+    // covers both prompts without needing to parse which one appears.
+    internal static string BuildFormatCommandArguments(string driveLetter, string fileSystem) =>
+        $"{driveLetter} /FS:{fileSystem} /V:KANGBOOT /Q";
+
+    private static Task FormatWithFormatExeAsync(string driveLetter, string fileSystem, CancellationToken ct) =>
+        RunProcessAsync("format.exe", BuildFormatCommandArguments(driveLetter, fileSystem), ct,
+            errorPrefix: "Gagal format partisi", stdinInput: "Y\r\nY\r\nY\r\n");
 
     private static Task<string> RunPowerShellAsync(string script, CancellationToken ct) =>
         RunProcessAsync(
@@ -180,7 +187,8 @@ public class Partitioner : IPartitioner
             ct,
             errorPrefix: "Gagal partisi/format drive");
 
-    private static async Task<string> RunProcessAsync(string fileName, string arguments, CancellationToken ct, string errorPrefix)
+    private static async Task<string> RunProcessAsync(
+        string fileName, string arguments, CancellationToken ct, string errorPrefix, string? stdinInput = null)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -188,12 +196,21 @@ public class Partitioner : IPartitioner
             Arguments = arguments,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = stdinInput is not null,
             UseShellExecute = false,
             CreateNoWindow = true
         };
 
         using var process = Process.Start(startInfo)
             ?? throw new IOException($"Gagal menjalankan {fileName}.");
+
+        // Written before reading stdout/stderr: the child buffers stdin regardless of
+        // whether it has asked for it yet, so this can't deadlock against the drains below.
+        if (stdinInput is not null)
+        {
+            await process.StandardInput.WriteAsync(stdinInput);
+            process.StandardInput.Close();
+        }
 
         // Drain both streams concurrently — see DismRunner/BootsectRunner for why
         // sequential reads risk a pipe-buffer deadlock.

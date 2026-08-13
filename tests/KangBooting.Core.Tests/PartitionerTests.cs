@@ -40,12 +40,11 @@ public class PartitionerTests
         var script = Partitioner.BuildCreatePartitionScript(diskNumber: 1, sizeMB: 16, isActive: true);
 
         Assert.Contains("New-Partition -DiskNumber 1 -Size 16MB -IsActive -AssignDriveLetter", script);
-        // Regression guard: real-hardware bug #1 — New-Partition -MbrType EFI is
-        // rejected on some Windows/PowerShell Storage module versions. Regression
-        // guard #2 — Format-Volume refuses NTFS on removable USB media ("Not
-        // Supported"), so no formatting happens here at all; both the MBR type byte
-        // and the actual format are done afterward via diskpart
-        // (BuildFormatPartitionDiskpartScript), which is subject to neither restriction.
+        // Regression guard: real-hardware bug — New-Partition -MbrType EFI is rejected
+        // on some Windows/PowerShell Storage module versions. No formatting happens
+        // here either — both Format-Volume and diskpart's format refuse various
+        // filesystems on this removable disk; formatting is done separately via
+        // format.exe (BuildFormatCommandArguments), which doesn't have that restriction.
         Assert.DoesNotContain("MbrType", script);
         Assert.DoesNotContain("Format-Volume", script);
         Assert.DoesNotContain("\"", script); // no embedded double quotes — see class comment on escaping
@@ -61,20 +60,19 @@ public class PartitionerTests
     }
 
     [Fact]
-    public void BuildFormatPartitionDiskpartScript_WithMbrType_SetsIdBeforeFormat()
+    public void BuildSetPartitionTypeDiskpartScript_SelectsDiskAndPartitionThenSetsId()
     {
-        var script = Partitioner.BuildFormatPartitionDiskpartScript(diskNumber: 1, partitionNumber: 2, fileSystem: "fat", mbrTypeHex: "ef");
+        var script = Partitioner.BuildSetPartitionTypeDiskpartScript(diskNumber: 1, partitionNumber: 2, mbrTypeHex: "ef");
 
-        Assert.Equal("select disk 1\r\nselect partition 2\r\nset id=ef override\r\nformat fs=fat quick label=\"KANGBOOT\"\r\n", script);
+        Assert.Equal("select disk 1\r\nselect partition 2\r\nset id=ef override\r\n", script);
     }
 
     [Fact]
-    public void BuildFormatPartitionDiskpartScript_NoMbrType_SkipsSetId()
+    public void BuildFormatCommandArguments_ComposesFormatExeArguments()
     {
-        var script = Partitioner.BuildFormatPartitionDiskpartScript(diskNumber: 1, partitionNumber: 2, fileSystem: "ntfs", mbrTypeHex: null);
+        var args = Partitioner.BuildFormatCommandArguments(driveLetter: "F:", fileSystem: "NTFS");
 
-        Assert.Equal("select disk 1\r\nselect partition 2\r\nformat fs=ntfs quick label=\"KANGBOOT\"\r\n", script);
-        Assert.DoesNotContain("set id", script);
+        Assert.Equal("F: /FS:NTFS /V:KANGBOOT /Q", args);
     }
 
     [Fact]
