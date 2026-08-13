@@ -176,8 +176,11 @@ public class Partitioner : IPartitioner
     internal static string BuildFormatCommandArguments(string driveLetter, string fileSystem) =>
         $"{driveLetter} /FS:{fileSystem} /V:KANGBOOT /Q";
 
+    // The real Windows executable is format.com, not format.exe — using the wrong name
+    // reproduced "cannot find file specified" on real hardware even though the file
+    // exists in System32.
     private static Task FormatWithFormatExeAsync(string driveLetter, string fileSystem, CancellationToken ct) =>
-        RunProcessAsync("format.exe", BuildFormatCommandArguments(driveLetter, fileSystem), ct,
+        RunProcessAsync("format.com", BuildFormatCommandArguments(driveLetter, fileSystem), ct,
             errorPrefix: "Gagal format partisi", stdinInput: "Y\r\nY\r\nY\r\n");
 
     private static Task<string> RunPowerShellAsync(string script, CancellationToken ct) =>
