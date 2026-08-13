@@ -133,9 +133,16 @@ public class Partitioner : IPartitioner
             return;
         }
 
-        NativeMethods.DeviceIoControl(
+        // Capture (rather than discard) the result: a failed refresh isn't fatal on its
+        // own — Windows may still pick up the new partition table another way — but if
+        // it fails, the drive-letter retry loop in LegacySplitWriter that runs right
+        // after this is far more likely to time out, and that's the first place a user
+        // sees an error. No logging framework here, so this is a one-line note rather
+        // than threading the flag through the frozen IPartitioner return types.
+        bool refreshed = NativeMethods.DeviceIoControl(
             handle, NativeMethods.IOCTL_DISK_UPDATE_PROPERTIES,
             IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
+        _ = refreshed;
     }
 
     public async Task WriteBootloaderImageAsync(

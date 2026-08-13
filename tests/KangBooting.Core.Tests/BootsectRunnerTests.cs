@@ -10,7 +10,7 @@ public class BootsectRunnerTests
     {
         var args = BootsectRunner.BuildArguments("D:");
 
-        Assert.Equal("/nt60 \"D:\" /force", args);
+        Assert.Equal("/nt60 \"D:\" /mbr /force", args);
     }
 
     [Theory]

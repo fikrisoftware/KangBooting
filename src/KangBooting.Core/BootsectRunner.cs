@@ -46,7 +46,7 @@ public class BootsectRunner : IBootsectRunner
 
     internal static string BuildArguments(string driveLetterOrPath)
     {
-        return $"/nt60 \"{driveLetterOrPath}\" /force";
+        return $"/nt60 \"{driveLetterOrPath}\" /mbr /force";
     }
 
     internal static bool IsSuccessExitCode(int exitCode) => exitCode == 0;
