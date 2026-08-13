@@ -169,10 +169,13 @@ public class Partitioner : IPartitioner
         }
     }
 
-    // format.com has no command-line flag to auto-confirm — it prompts on stdin
-    // ("Proceed with Format (Y/N)?" and, if the volume already carries a label, "Enter
-    // current volume label for drive X:"). Answering blind with several "Y\r\n" lines
-    // covers both prompts without needing to parse which one appears.
+    // format.com has no command-line flag to auto-confirm — it prompts on stdin. For
+    // removable media specifically it asks "Insert new disk for drive X: and press
+    // ENTER when ready..." (any input, including "Y", proceeds), then after formatting
+    // completes it asks "Format another (Y/N)?". Real-hardware bug: answering that
+    // second prompt with "Y" (from a blind multi-"Y" answer) makes it loop back into a
+    // SECOND format pass, whose failure was what actually surfaced as "Format failed" —
+    // the first pass had already completed successfully. Must answer "N" there.
     internal static string BuildFormatCommandArguments(string driveLetter, string fileSystem) =>
         $"{driveLetter} /FS:{fileSystem} /V:KANGBOOT /Q";
 
@@ -181,7 +184,7 @@ public class Partitioner : IPartitioner
     // exists in System32.
     private static Task FormatWithFormatExeAsync(string driveLetter, string fileSystem, CancellationToken ct) =>
         RunProcessAsync("format.com", BuildFormatCommandArguments(driveLetter, fileSystem), ct,
-            errorPrefix: "Gagal format partisi", stdinInput: "Y\r\nY\r\nY\r\n");
+            errorPrefix: "Gagal format partisi", stdinInput: "Y\r\nN\r\n");
 
     private static Task<string> RunPowerShellAsync(string script, CancellationToken ct) =>
         RunProcessAsync(
