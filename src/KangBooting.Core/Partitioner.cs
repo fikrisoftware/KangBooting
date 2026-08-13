@@ -17,7 +17,16 @@ public class Partitioner : IPartitioner
     // UEFI:NTFS boot partition is a small FAT12/16-formatted EFI system partition
     // holding just the bootloader binary at EFI\Boot\bootx64.efi (placed by
     // WriteBootloaderImageAsync), which chain-loads into the NTFS data partition.
-    private const long BootPartitionBytes = 1 * 1024 * 1024;
+    // Root-cause fix (confirmed on real hardware + reproduced via a throwaway probe):
+    // 1MiB was too small for DiscUtils' FatFileSystem.FormatPartition(disk, index,
+    // label) convenience overload, which threw ArgumentException("Requested size is
+    // too small for a partition") — the on-disk partition was created (correct size)
+    // but left unformatted ("Unknown" filesystem type in Windows) because formatting
+    // failed right after. Probed 1/2/4/8/16/32 MiB against the real DiscUtils 0.16.13
+    // FAT formatter: 1/2/4 MiB fail, 8 MiB is the minimum that succeeds. 16 MiB gives
+    // headroom above that measured threshold — still negligible relative to any USB
+    // drive's capacity.
+    internal const long BootPartitionBytes = 16 * 1024 * 1024;
 
     // 1MiB alignment for the first partition start — standard modern practice
     // (matches Windows/diskpart/GPT default alignment), avoids relying on the
