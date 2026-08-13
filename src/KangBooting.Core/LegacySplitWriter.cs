@@ -11,8 +11,14 @@ public class LegacySplitWriter : IWriteEngine
     private readonly IBootsectRunner _bootsectRunner;
 
     private const int FourGigabytes = 4000; // MB, matches spec's split threshold
-    private const int DriveLetterRetryAttempts = 5;
-    private static readonly TimeSpan DriveLetterRetryDelay = TimeSpan.FromMilliseconds(300);
+    // IOCTL_DISK_UPDATE_PROPERTIES (Partitioner.RefreshPartitionTable) fires while the
+    // old volume's lock handle is still open (inside LockVolume's using-block in
+    // WriteAsync below) — observed on real hardware to mean Windows' mount manager
+    // doesn't finish reassigning a drive letter until well after that handle closes,
+    // often several seconds later. 5 attempts * 300ms (1.5s total) was not enough in
+    // practice; widened to give the mount manager realistic time to catch up.
+    private const int DriveLetterRetryAttempts = 30;
+    private static readonly TimeSpan DriveLetterRetryDelay = TimeSpan.FromMilliseconds(500);
 
     public LegacySplitWriter(
         IDriveService driveService, IPartitioner partitioner, IDismRunner dismRunner, IBootsectRunner bootsectRunner)
