@@ -87,17 +87,29 @@ public class FlashViewModel : INotifyPropertyChanged
             throw new InvalidOperationException("Pilih ISO dan drive terlebih dahulu sebelum flash.");
         }
 
+        // I6: fail fast, before wiping the drive, if it's clearly too small for the ISO.
+        // +2MB margin covers Legacy mode's boot partition overhead; UEFI:NTFS overhead
+        // is smaller still, so the same margin is safe for both modes.
+        var isoSizeBytes = new FileInfo(SelectedIsoPath).Length;
+        if (SelectedDrive.SizeBytes < isoSizeBytes + 2_000_000)
+        {
+            throw new InvalidOperationException("Ukuran drive terlalu kecil untuk ISO ini.");
+        }
+
         var progress = new Progress<WriteProgress>(p => CurrentProgress = p);
         var writeEngine = _writeEngineFactory(SelectedBootMode);
+        var isoPath = SelectedIsoPath;
+        var drive = SelectedDrive;
 
-        var sourceHash = await ComputeSourceHashAsync(SelectedIsoPath, ct);
+        // ponytail: write pipeline (Partitioner + engine copy loops) is synchronous I/O
+        // under the hood; Task.Run moves it off the caller's (UI) thread. IProgress<T>
+        // still marshals back to that thread automatically.
+        await Task.Run(() => writeEngine.WriteAsync(isoPath, drive, progress, ct), ct);
 
-        await writeEngine.WriteAsync(SelectedIsoPath, SelectedDrive, progress, ct);
-
-        CurrentProgress = new WriteProgress(100, 0, TimeSpan.Zero, "Verifying");
-        // Full post-write verification strategy (per-file for UEFI:NTFS mode,
-        // per-.swm-chunk for split mode) is implemented against real hardware
-        // during manual testing — see docs/superpowers/plans/manual-test-checklist-phase1.md.
+        // Post-write verification is not implemented in Phase 1 (full per-file/
+        // per-chunk checksum verification is a larger feature, out of scope here).
+        // _checksumService/ComputeSourceHashAsync are kept as infrastructure for
+        // when that's built; nothing currently calls them.
     }
 
     private async Task<string> ComputeSourceHashAsync(string isoPath, CancellationToken ct)
