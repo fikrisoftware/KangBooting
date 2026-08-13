@@ -24,7 +24,11 @@
         <ProgressBar x:Name="FlashProgressBar" Width="400" Minimum="0" Maximum="100"
                      Value="{x:Bind ViewModel.CurrentProgress.PercentComplete, Mode=OneWay}" />
 
-        <Button x:Name="FlashButton" Content="Flash" Click="FlashButton_Click" />
+        <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button x:Name="FlashButton" Content="Flash" Click="FlashButton_Click" />
+            <Button x:Name="CancelButton" Content="Batal" Click="CancelButton_Click" Visibility="Collapsed" />
+            <Button x:Name="RetryButton" Content="Coba Lagi" Click="RetryButton_Click" Visibility="Collapsed" />
+        </StackPanel>
 
         <TextBlock x:Name="ErrorTextBlock" Foreground="Red" TextWrapping="Wrap" Visibility="Collapsed" />
     </StackPanel>

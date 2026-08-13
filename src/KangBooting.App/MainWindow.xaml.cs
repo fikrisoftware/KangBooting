@@ -69,22 +69,41 @@ public sealed partial class MainWindow : Window
             : BootMode.LegacySplitFat32;
     }
 
-    private async void FlashButton_Click(object sender, RoutedEventArgs e)
+    private async void FlashButton_Click(object sender, RoutedEventArgs e) => await RunFlashAsync();
+
+    private async void RetryButton_Click(object sender, RoutedEventArgs e) => await RunFlashAsync();
+
+    private void CancelButton_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.CancelFlash();
+    }
+
+    private async Task RunFlashAsync()
     {
         FlashButton.IsEnabled = false;
+        RetryButton.Visibility = Visibility.Collapsed;
+        CancelButton.Visibility = Visibility.Visible;
         ErrorTextBlock.Visibility = Visibility.Collapsed;
         try
         {
             await ViewModel.FlashAsync();
         }
+        catch (OperationCanceledException)
+        {
+            ErrorTextBlock.Text = "Proses dibatalkan.";
+            ErrorTextBlock.Visibility = Visibility.Visible;
+            RetryButton.Visibility = Visibility.Visible;
+        }
         catch (Exception ex)
         {
             ErrorTextBlock.Text = ex.Message;
             ErrorTextBlock.Visibility = Visibility.Visible;
+            RetryButton.Visibility = Visibility.Visible;
         }
         finally
         {
             FlashButton.IsEnabled = true;
+            CancelButton.Visibility = Visibility.Collapsed;
         }
     }
 }

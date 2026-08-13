@@ -80,8 +80,17 @@ public class FlashViewModel : INotifyPropertyChanged
         SelectedBootMode = RecommendedBootMode;
     }
 
+    private CancellationTokenSource? _flashCts;
+
+    public void CancelFlash()
+    {
+        _flashCts?.Cancel();
+    }
+
     public async Task FlashAsync(CancellationToken ct = default)
     {
+        _flashCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        ct = _flashCts.Token;
         if (SelectedIsoPath is null || SelectedDrive is null)
         {
             throw new InvalidOperationException("Pilih ISO dan drive terlebih dahulu sebelum flash.");
@@ -101,15 +110,23 @@ public class FlashViewModel : INotifyPropertyChanged
         var isoPath = SelectedIsoPath;
         var drive = SelectedDrive;
 
-        // ponytail: write pipeline (Partitioner + engine copy loops) is synchronous I/O
-        // under the hood; Task.Run moves it off the caller's (UI) thread. IProgress<T>
-        // still marshals back to that thread automatically.
-        await Task.Run(() => writeEngine.WriteAsync(isoPath, drive, progress, ct), ct);
+        try
+        {
+            // ponytail: write pipeline (Partitioner + engine copy loops) is synchronous I/O
+            // under the hood; Task.Run moves it off the caller's (UI) thread. IProgress<T>
+            // still marshals back to that thread automatically.
+            await Task.Run(() => writeEngine.WriteAsync(isoPath, drive, progress, ct), ct);
 
-        // Post-write verification is not implemented in Phase 1 (full per-file/
-        // per-chunk checksum verification is a larger feature, out of scope here).
-        // _checksumService/ComputeSourceHashAsync are kept as infrastructure for
-        // when that's built; nothing currently calls them.
+            // Post-write verification is not implemented in Phase 1 (full per-file/
+            // per-chunk checksum verification is a larger feature, out of scope here).
+            // _checksumService/ComputeSourceHashAsync are kept as infrastructure for
+            // when that's built; nothing currently calls them.
+        }
+        finally
+        {
+            _flashCts?.Dispose();
+            _flashCts = null;
+        }
     }
 
     private async Task<string> ComputeSourceHashAsync(string isoPath, CancellationToken ct)
