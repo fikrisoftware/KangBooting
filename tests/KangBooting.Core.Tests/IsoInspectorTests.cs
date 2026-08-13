@@ -18,12 +18,15 @@ public class IsoInspectorTests : IDisposable
         Directory.Delete(_tempDir, recursive: true);
     }
 
-    private string BuildIso(bool includeBiosBoot, bool includeUefiBoot, int installWimSizeMb)
+    private string BuildIso(bool includeBiosBoot, bool includeUefiBoot, int installWimSizeMb, bool includeInstallImage = true)
     {
         var builder = new CDBuilder { UseJoliet = true };
 
-        var wimBytes = new byte[installWimSizeMb * 1024 * 1024];
-        builder.AddFile(@"sources\install.wim", wimBytes);
+        if (includeInstallImage)
+        {
+            var wimBytes = new byte[installWimSizeMb * 1024 * 1024];
+            builder.AddFile(@"sources\install.wim", wimBytes);
+        }
 
         if (includeBiosBoot)
         {
@@ -77,5 +80,16 @@ public class IsoInspectorTests : IDisposable
         var result = await inspector.AnalyzeAsync(isoPath);
 
         Assert.False(result.HasBiosBootSector);
+    }
+
+    [Fact]
+    public async Task AnalyzeAsync_NoInstallImage_ReturnsNull()
+    {
+        var isoPath = BuildIso(includeBiosBoot: false, includeUefiBoot: false, installWimSizeMb: 0, includeInstallImage: false);
+        var inspector = new IsoInspector();
+
+        var result = await inspector.AnalyzeAsync(isoPath);
+
+        Assert.Null(result.InstallImageSizeBytes);
     }
 }
