@@ -20,35 +20,35 @@ public class FlashViewModel : INotifyPropertyChanged
     public string? SelectedIsoPath
     {
         get => _selectedIsoPath;
-        set { _selectedIsoPath = value; OnPropertyChanged(); }
+        set => SetField(ref _selectedIsoPath, value);
     }
 
     private UsbDriveInfo? _selectedDrive;
     public UsbDriveInfo? SelectedDrive
     {
         get => _selectedDrive;
-        set { _selectedDrive = value; OnPropertyChanged(); }
+        set => SetField(ref _selectedDrive, value);
     }
 
     private BootMode _recommendedBootMode;
     public BootMode RecommendedBootMode
     {
         get => _recommendedBootMode;
-        private set { _recommendedBootMode = value; OnPropertyChanged(); }
+        private set => SetField(ref _recommendedBootMode, value);
     }
 
     private BootMode _selectedBootMode;
     public BootMode SelectedBootMode
     {
         get => _selectedBootMode;
-        set { _selectedBootMode = value; OnPropertyChanged(); }
+        set => SetField(ref _selectedBootMode, value);
     }
 
     private WriteProgress? _currentProgress;
     public WriteProgress? CurrentProgress
     {
         get => _currentProgress;
-        private set { _currentProgress = value; OnPropertyChanged(); }
+        private set => SetField(ref _currentProgress, value);
     }
 
     public FlashViewModel(
@@ -116,6 +116,21 @@ public class FlashViewModel : INotifyPropertyChanged
     {
         using var stream = File.OpenRead(isoPath);
         return await _checksumService.ComputeSha256Async(stream, ct);
+    }
+
+    // Guards against re-entrant set->PropertyChanged->binding-writes-back->set loops
+    // (e.g. a ComboBox two-way-bound to SelectedDrive recursing into a
+    // StackOverflowException when the setter unconditionally re-raised
+    // PropertyChanged even for an unchanged value).
+    private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(field, value))
+        {
+            return;
+        }
+
+        field = value;
+        OnPropertyChanged(propertyName);
     }
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
