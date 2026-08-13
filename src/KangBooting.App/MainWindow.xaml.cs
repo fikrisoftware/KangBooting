@@ -40,8 +40,18 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        ErrorTextBlock.Visibility = Visibility.Collapsed;
         IsoPathTextBox.Text = file.Path;
-        await ViewModel.LoadIsoAsync(file.Path);
+        try
+        {
+            await ViewModel.LoadIsoAsync(file.Path);
+        }
+        catch (Exception ex)
+        {
+            ErrorTextBlock.Text = ex.Message;
+            ErrorTextBlock.Visibility = Visibility.Visible;
+            return;
+        }
 
         UefiNtfsRadio.IsChecked = ViewModel.SelectedBootMode == BootMode.UefiNtfs;
         LegacySplitRadio.IsChecked = ViewModel.SelectedBootMode == BootMode.LegacySplitFat32;
@@ -57,9 +67,15 @@ public sealed partial class MainWindow : Window
     private async void FlashButton_Click(object sender, RoutedEventArgs e)
     {
         FlashButton.IsEnabled = false;
+        ErrorTextBlock.Visibility = Visibility.Collapsed;
         try
         {
             await ViewModel.FlashAsync();
+        }
+        catch (Exception ex)
+        {
+            ErrorTextBlock.Text = ex.Message;
+            ErrorTextBlock.Visibility = Visibility.Visible;
         }
         finally
         {
