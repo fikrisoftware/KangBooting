@@ -1,0 +1,11 @@
+D:\Private\Iseng\src\KangBooting.Core\bin\Debug\net8.0\KangBooting.Core.deps.json
+D:\Private\Iseng\src\KangBooting.Core\bin\Debug\net8.0\KangBooting.Core.dll
+D:\Private\Iseng\src\KangBooting.Core\bin\Debug\net8.0\KangBooting.Core.pdb
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.GeneratedMSBuildEditorConfig.editorconfig
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.AssemblyInfoInputs.cache
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.AssemblyInfo.cs
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.csproj.CoreCompileInputs.cache
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.dll
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\refint\KangBooting.Core.dll
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\KangBooting.Core.pdb
+D:\Private\Iseng\src\KangBooting.Core\obj\Debug\net8.0\ref\KangBooting.Core.dll
