@@ -1,6 +1,5 @@
 using KangBooting.Core;
 using Microsoft.UI.Xaml;
-using Windows.Storage.Pickers;
 using WinRT.Interop;
 
 namespace KangBooting.App;
@@ -26,26 +25,31 @@ public sealed partial class MainWindow : Window
                 ? new UefiNtfsWriter(driveService, partitioner)
                 : new LegacySplitWriter(driveService, partitioner, dismRunner, bootsectRunner));
 
-        ViewModel.RefreshDrives();
+        try
+        {
+            ViewModel.RefreshDrives();
+        }
+        catch (Exception ex)
+        {
+            ErrorTextBlock.Text = ex.Message;
+            ErrorTextBlock.Visibility = Visibility.Visible;
+        }
     }
 
     private async void PickIsoButton_Click(object sender, RoutedEventArgs e)
     {
-        var picker = new FileOpenPicker();
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
-        picker.FileTypeFilter.Add(".iso");
-
-        var file = await picker.PickSingleFileAsync();
-        if (file is null)
+        var hwnd = WindowNative.GetWindowHandle(this);
+        var isoPath = Win32FileDialog.PickIsoFile(hwnd);
+        if (isoPath is null)
         {
             return;
         }
 
         ErrorTextBlock.Visibility = Visibility.Collapsed;
-        IsoPathTextBox.Text = file.Path;
+        IsoPathTextBox.Text = isoPath;
         try
         {
-            await ViewModel.LoadIsoAsync(file.Path);
+            await ViewModel.LoadIsoAsync(isoPath);
         }
         catch (Exception ex)
         {

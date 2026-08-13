@@ -41,8 +41,14 @@ public class DriveService : IDriveService
     {
         // Partition/logical-disk association query kept separate so it can fail
         // independently without aborting the whole drive listing.
+        // NOTE: deviceId is used verbatim (no backslash-doubling) here. Unlike a WQL
+        // WHERE-clause string literal, the WMI object-path syntax inside ASSOCIATORS OF
+        // {...} does NOT want backslashes escaped — doubling them breaks the path and
+        // WMI throws ManagementException "Not found". Verified empirically against a
+        // real USB drive: deviceId as-is resolves correctly, deviceId.Replace(@"\", @"\\")
+        // does not.
         using var searcher = new ManagementObjectSearcher(
-            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{deviceId.Replace(@"\", @"\\")}'}} " +
+            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{deviceId}'}} " +
             "WHERE AssocClass = Win32_DiskDriveToDiskPartition");
 
         foreach (ManagementObject partition in searcher.Get())
@@ -69,8 +75,9 @@ public class DriveService : IDriveService
     // finished re-reading the partition table — see Partitioner.RefreshPartitionTable).
     public string? GetDriveLetterForPartition(string deviceId, int partitionIndex)
     {
+        // See GetFileSystem above: deviceId must be used verbatim, not backslash-escaped.
         using var searcher = new ManagementObjectSearcher(
-            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{deviceId.Replace(@"\", @"\\")}'}} " +
+            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{deviceId}'}} " +
             "WHERE AssocClass = Win32_DiskDriveToDiskPartition");
 
         foreach (ManagementObject partition in searcher.Get())
