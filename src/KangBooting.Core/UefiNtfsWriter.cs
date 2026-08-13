@@ -27,17 +27,28 @@ public class UefiNtfsWriter : IWriteEngine
 
         using (var volumeLock = _driveService.LockVolume(target.DeviceId))
         {
-            var (bootPartition, dataPartition) = await _partitioner
-                .CreateUefiNtfsLayoutAsync(target, ct);
+            try
+            {
+                var (bootPartition, dataPartition) = await _partitioner
+                    .CreateUefiNtfsLayoutAsync(target, ct);
 
-            var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "bootx64_signed.efi");
-            await _partitioner.WriteBootloaderImageAsync(
-                bootPartition, bootloaderImagePath, ct);
+                var bootloaderImagePath = Path.Combine(AppContext.BaseDirectory, "assets", "bootx64_signed.efi");
+                await _partitioner.WriteBootloaderImageAsync(
+                    bootPartition, bootloaderImagePath, ct);
 
-            progress.Report(new WriteProgress(10, 0, null, "Copying files"));
+                progress.Report(new WriteProgress(10, 0, null, "Copying files"));
 
-            using var ntfs = _partitioner.OpenNtfsFileSystem(dataPartition);
-            CopyIsoContentsToFileSystem(cdReader, ntfs, progress);
+                using var ntfs = _partitioner.OpenNtfsFileSystem(dataPartition);
+                CopyIsoContentsToFileSystem(cdReader, ntfs, progress);
+            }
+            finally
+            {
+                // See LegacySplitWriter's equivalent call: an open Disk handle left over
+                // from a failed/completed attempt blocks a subsequent Retry (same
+                // process) from reopening the same physical disk — confirmed on real
+                // hardware in the Legacy mode path; fixed here too for consistency.
+                _partitioner.ReleaseOpenDisks();
+            }
         }
 
         progress.Report(new WriteProgress(100, 0, TimeSpan.Zero, "Selesai"));

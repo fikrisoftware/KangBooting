@@ -24,6 +24,28 @@ public class Partitioner : IPartitioner
     // library's CHS/cylinder rounding for such a small partition.
     private const long AlignmentSectors = 2048;
 
+    // Root-cause fix (confirmed on real hardware): Open*FileSystem previously left the
+    // backing Disk device handle open with no way to close it (see the comment above
+    // those methods for why). This was flagged as a known limitation, then reproduced
+    // live: clicking "Coba Lagi" (Retry) within the same running process failed with
+    // "The process cannot access the file '\\.\PHYSICALDRIVEn' because it is being
+    // used by another process" — the FIRST attempt's leaked Disk handle was still open,
+    // blocking the retry's own attempt to open the same physical disk. Tracking every
+    // opened Disk here and releasing them via ReleaseOpenDisks() (called from each
+    // IWriteEngine's finally block) closes that gap without changing IPartitioner's
+    // Open*FileSystem return types.
+    private readonly List<Disk> _openDisks = new();
+
+    public void ReleaseOpenDisks()
+    {
+        foreach (var disk in _openDisks)
+        {
+            disk.Dispose();
+        }
+
+        _openDisks.Clear();
+    }
+
     public Task<(PartitionHandle bootPartition, PartitionHandle dataPartition)> CreateUefiNtfsLayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
@@ -170,18 +192,15 @@ public class Partitioner : IPartitioner
         bootloaderContent.CopyTo(destStream);
     }
 
-    // Both Open*FileSystem methods below intentionally leak the underlying `Disk` handle:
-    // the frozen IPartitioner interface returns a bare NtfsFileSystem/FatFileSystem with
-    // no hook to dispose the Disk that backs its stream, so the device handle is left
-    // open, relying on process exit or GC finalization to release it. This is safe for
-    // this tool's short-lived, one-write-per-run CLI usage pattern. It is NOT safe to
-    // assume in a long-running process: callers (the app layer) must avoid
-    // opening/closing the same physical drive multiple times within one process run
-    // without accounting for accumulating open device handles. Fixing this properly
-    // requires an IPartitioner interface change (out of scope here).
+    // Both Open*FileSystem methods return a bare NtfsFileSystem/FatFileSystem (per the
+    // IPartitioner contract) with no hook for the caller to dispose the Disk backing its
+    // stream. Rather than leak it, the Disk is tracked in _openDisks and released via
+    // ReleaseOpenDisks() (called from each IWriteEngine's finally block) once the
+    // returned filesystem is no longer needed.
     public NtfsFileSystem OpenNtfsFileSystem(PartitionHandle partition)
     {
         var disk = new Disk(partition.DeviceId, FileAccess.ReadWrite);
+        _openDisks.Add(disk);
         var table = new BiosPartitionTable(disk);
         return new NtfsFileSystem(table.Partitions[partition.PartitionIndex].Open());
     }
@@ -189,6 +208,7 @@ public class Partitioner : IPartitioner
     public FatFileSystem OpenFat32FileSystem(PartitionHandle partition)
     {
         var disk = new Disk(partition.DeviceId, FileAccess.ReadWrite);
+        _openDisks.Add(disk);
         var table = new BiosPartitionTable(disk);
         return new FatFileSystem(table.Partitions[partition.PartitionIndex].Open());
     }

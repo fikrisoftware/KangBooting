@@ -19,4 +19,11 @@ public interface IPartitioner
     NtfsFileSystem OpenNtfsFileSystem(PartitionHandle partition);
 
     FatFileSystem OpenFat32FileSystem(PartitionHandle partition);
+
+    // Releases any physical-disk handles opened by Open*FileSystem above. Callers
+    // (IWriteEngine implementations) must call this once done with the returned
+    // filesystem(s) — in a finally block, so it runs on both success and failure —
+    // otherwise a leaked handle from one write blocks a subsequent retry within the
+    // same process from reopening the same physical disk.
+    void ReleaseOpenDisks();
 }

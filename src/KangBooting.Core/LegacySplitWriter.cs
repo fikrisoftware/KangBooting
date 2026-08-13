@@ -69,6 +69,13 @@ public class LegacySplitWriter : IWriteEngine
                 CopyDirectoryToFileSystem(stagingDir, fat32, "");
             }
 
+            // Release the Disk handle opened by OpenFat32FileSystem now, before waiting
+            // for Windows to assign a drive letter below — holding it open blocks the
+            // OS's mount manager from fully re-enumerating the disk (same root cause as
+            // the leaked-handle-blocks-retry bug this fixes; here it also plausibly
+            // delays/prevents drive-letter assignment on the same attempt).
+            _partitioner.ReleaseOpenDisks();
+
             // C2: write BIOS-bootable MBR/VBR boot code onto the FAT32 partition now that
             // it's formatted and populated. Requires a drive letter, which PartitionHandle
             // (a raw DeviceId+PartitionIndex reference) doesn't carry — resolved via WMI,
@@ -88,6 +95,10 @@ public class LegacySplitWriter : IWriteEngine
         }
         finally
         {
+            // Must run even on failure/cancellation: an open Disk handle left over from
+            // a failed attempt blocks a subsequent Retry (same process) from reopening
+            // the same physical disk — confirmed on real hardware.
+            _partitioner.ReleaseOpenDisks();
             Directory.Delete(stagingDir, recursive: true);
         }
 
