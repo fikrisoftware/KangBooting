@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using KangBooting.Core;
 
@@ -53,6 +54,9 @@ public class FlashViewModel : INotifyPropertyChanged
             if (SetField(ref _currentProgress, value))
             {
                 OnPropertyChanged(nameof(ProgressLabel));
+                OnPropertyChanged(nameof(LastUpdateLabel));
+                OnPropertyChanged(nameof(EtaLabel));
+                UpdateSteps();
             }
         }
     }
@@ -62,7 +66,54 @@ public class FlashViewModel : INotifyPropertyChanged
     // percent text were never actually shown anywhere.
     public string ProgressLabel => CurrentProgress is null
         ? ""
-        : $"{CurrentProgress.CurrentOperation} - {CurrentProgress.PercentComplete:F0}%";
+        : $"{CurrentProgress.CurrentOperation} — {CurrentProgress.PercentComplete:F0}%";
+
+    public string LastUpdateLabel => CurrentProgress is null
+        ? ""
+        : $"Update terakhir: {DateTime.Now:HH:mm:ss}";
+
+    public string EtaLabel => CurrentProgress?.EstimatedTimeRemaining is { } eta
+        ? $"Estimasi selesai: {FormatDuration(eta)} lagi"
+        : "";
+
+    private readonly Stopwatch _flashStopwatch = new();
+
+    public string ElapsedLabel => _flashStopwatch.IsRunning || _flashStopwatch.Elapsed > TimeSpan.Zero
+        ? $"Berjalan: {FormatDuration(_flashStopwatch.Elapsed)}"
+        : "";
+
+    // Called on a UI timer (see MainWindow) so Elapsed keeps ticking even during phases
+    // that report no progress events for a while (e.g. dism.exe splitting a large file).
+    public void RefreshTimeDisplay()
+    {
+        OnPropertyChanged(nameof(ElapsedLabel));
+    }
+
+    private static string FormatDuration(TimeSpan duration) => duration.TotalHours >= 1
+        ? duration.ToString(@"h\:mm\:ss")
+        : duration.ToString(@"m\:ss");
+
+    // Fixed checklist mapped to overall percent-complete ranges — deliberately not tied
+    // to each IWriteEngine's exact operation-label text, which differs between
+    // UEFI:NTFS/Legacy mode and between the mount-first/DiscUtils-fallback code paths.
+    public IReadOnlyList<ProcessStepViewModel> Steps { get; } = new List<ProcessStepViewModel>
+    {
+        new("Menyiapkan & memformat drive", thresholdEnd: 10),
+        new("Menyalin file installer", thresholdEnd: 85),
+        new("Menulis boot code", thresholdEnd: 99),
+        new("Selesai", thresholdEnd: 100),
+    };
+
+    private void UpdateSteps()
+    {
+        var percent = CurrentProgress?.PercentComplete ?? 0;
+        double thresholdStart = 0;
+        foreach (var step in Steps)
+        {
+            step.UpdateForPercent(percent, thresholdStart);
+            thresholdStart = step.ThresholdEnd;
+        }
+    }
 
     public FlashViewModel(
         IIsoInspector isoInspector,
@@ -123,6 +174,14 @@ public class FlashViewModel : INotifyPropertyChanged
         var isoPath = SelectedIsoPath;
         var drive = SelectedDrive;
 
+        foreach (var step in Steps)
+        {
+            step.Reset();
+        }
+
+        CurrentProgress = null;
+        _flashStopwatch.Restart();
+
         try
         {
             // ponytail: write pipeline (Partitioner + engine copy loops) is synchronous I/O
@@ -137,6 +196,7 @@ public class FlashViewModel : INotifyPropertyChanged
         }
         finally
         {
+            _flashStopwatch.Stop();
             _flashCts?.Dispose();
             _flashCts = null;
         }

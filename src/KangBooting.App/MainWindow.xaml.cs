@@ -1,4 +1,5 @@
 using KangBooting.Core;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using WinRT.Interop;
@@ -9,9 +10,17 @@ public sealed partial class MainWindow : Window
 {
     public FlashViewModel ViewModel { get; }
 
+    // Ticks ElapsedLabel once a second while flashing, so it keeps moving even during a
+    // phase that reports no progress events for a while (e.g. dism.exe splitting a large
+    // install.wim, or waiting for Windows to assign a drive letter).
+    private readonly DispatcherTimer _elapsedTimer;
+
     public MainWindow()
     {
         InitializeComponent();
+
+        _elapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _elapsedTimer.Tick += (_, _) => ViewModel.RefreshTimeDisplay();
 
         var driveService = new DriveService();
         var partitioner = new Partitioner();
@@ -98,6 +107,7 @@ public sealed partial class MainWindow : Window
         RetryButton.Visibility = Visibility.Collapsed;
         CancelButton.Visibility = Visibility.Visible;
         ErrorTextBlock.Visibility = Visibility.Collapsed;
+        _elapsedTimer.Start();
         try
         {
             await ViewModel.FlashAsync();
@@ -116,6 +126,8 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            _elapsedTimer.Stop();
+            ViewModel.RefreshTimeDisplay();
             FlashButton.IsEnabled = true;
             CancelButton.Visibility = Visibility.Collapsed;
         }
