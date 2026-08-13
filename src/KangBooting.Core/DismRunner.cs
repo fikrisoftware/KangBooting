@@ -26,7 +26,12 @@ public class DismRunner : IDismRunner
         using var process = Process.Start(startInfo)
             ?? throw new IOException("Gagal menjalankan dism.exe. Pastikan Windows ADK/DISM tersedia di sistem.");
 
-        string stderr = await process.StandardError.ReadToEndAsync(ct);
+        // ponytail: dism.exe streams verbose progress to stdout during /Split-Image;
+        // reading stderr alone risks a pipe-buffer deadlock, so drain both concurrently.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+        var stderrTask = process.StandardError.ReadToEndAsync(ct);
+        await Task.WhenAll(stdoutTask, stderrTask);
+        string stderr = await stderrTask;
         await process.WaitForExitAsync(ct);
 
         if (!IsSuccessExitCode(process.ExitCode))

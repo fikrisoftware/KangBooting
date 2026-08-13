@@ -61,25 +61,37 @@ public class LegacySplitWriter : IWriteEngine
         progress.Report(new WriteProgress(100, 0, TimeSpan.Zero, "Selesai"));
     }
 
-    private static void ExtractIsoToDirectory(CDReader source, string destinationDir, string path = "")
+    internal static void ExtractIsoToDirectory(CDReader source, string destinationDir, string path = "")
     {
         // ponytail: GetDirectories(path)/GetFiles(path) without SearchOption default to
         // TopDirectoryOnly (same convention as System.IO), so this recurses manually —
         // the brief's single-level version would silently skip sources\install.wim.
         foreach (var dir in source.GetDirectories(path))
         {
-            Directory.CreateDirectory(Path.Combine(destinationDir, dir));
+            // ponytail: DiscUtils returns paths like "\sources" — Path.Combine treats a
+            // leading separator as drive-rooted, so trim it before combining (same fix
+            // as UefiNtfsWriter.StripIsoVersionSuffix handles for the ";1" file suffix).
+            Directory.CreateDirectory(Path.Combine(destinationDir, TrimLeadingSeparator(dir)));
             ExtractIsoToDirectory(source, destinationDir, dir);
         }
 
         foreach (var file in source.GetFiles(path))
         {
-            var destPath = Path.Combine(destinationDir, file);
+            var relativePath = TrimLeadingSeparator(StripIsoVersionSuffix(file));
+            var destPath = Path.Combine(destinationDir, relativePath);
             Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
             using var sourceStream = source.OpenFile(file, FileMode.Open);
             using var destStream = File.Create(destPath);
             sourceStream.CopyTo(destStream);
         }
+    }
+
+    private static string TrimLeadingSeparator(string path) => path.TrimStart('\\', '/');
+
+    private static string StripIsoVersionSuffix(string isoPath)
+    {
+        var semicolonIndex = isoPath.LastIndexOf(';');
+        return semicolonIndex >= 0 ? isoPath[..semicolonIndex] : isoPath;
     }
 
     private static void CopyDirectoryToFileSystem(string sourceDir, IFileSystem destination, string relativePath)
