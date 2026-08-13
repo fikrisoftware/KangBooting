@@ -1,0 +1,29 @@
+<Window
+    x:Class="KangBooting.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <StackPanel Margin="16" Spacing="12">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBox x:Name="IsoPathTextBox" Width="400" IsReadOnly="True" PlaceholderText="Pilih file ISO..." />
+            <Button x:Name="PickIsoButton" Content="Pilih ISO" Click="PickIsoButton_Click" />
+        </StackPanel>
+
+        <ComboBox x:Name="DriveComboBox"
+                  Width="400"
+                  PlaceholderText="Pilih drive USB"
+                  ItemsSource="{x:Bind ViewModel.AvailableDrives}"
+                  SelectedItem="{x:Bind ViewModel.SelectedDrive, Mode=TwoWay}"
+                  DisplayMemberPath="DisplayName" />
+
+        <StackPanel Orientation="Horizontal" Spacing="8">
+            <RadioButton x:Name="UefiNtfsRadio" Content="UEFI:NTFS" GroupName="BootMode" Checked="BootModeRadio_Checked" />
+            <RadioButton x:Name="LegacySplitRadio" Content="Legacy+Split FAT32" GroupName="BootMode" Checked="BootModeRadio_Checked" />
+        </StackPanel>
+
+        <ProgressBar x:Name="FlashProgressBar" Width="400" Minimum="0" Maximum="100"
+                     Value="{x:Bind ViewModel.CurrentProgress.PercentComplete, Mode=OneWay}" />
+
+        <Button x:Name="FlashButton" Content="Flash" Click="FlashButton_Click" />
+    </StackPanel>
+</Window>

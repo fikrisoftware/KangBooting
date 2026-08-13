@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/KangBooting.Core/KangBooting.Core.csproj" />
+    <Project Path="src/KangBooting.App/KangBooting.App.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/KangBooting.Core.Tests/KangBooting.Core.Tests.csproj" />
