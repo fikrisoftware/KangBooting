@@ -12,36 +12,57 @@ namespace KangBooting.Core;
 // module cmdlets (New-Partition/Format-Volume) are what Windows Setup and diskpart
 // themselves use to partition/format disks, and — shelled out to via powershell.exe,
 // the same reliable pattern already used by IsoMounter/DismRunner/BootsectRunner — have
-// shown none of these issues. Partitioning, formatting, and drive-letter assignment are
-// all done natively now; DiscUtils remains only for the ISO-reading fallback
-// (IsoFileSystemOpener), a lower-risk read-only concern that hasn't had a real-hardware
-// bug. This also eliminates the previous FSCTL_LOCK_VOLUME/drive-letter-polling dance
-// (DriveService.LockVolume, DriveLetterResolver) entirely: New-Partition/Format-Volume
-// are synchronous and handle volume locking and drive-letter assignment internally as
-// part of their own job, so callers get a ready-to-use drive letter the moment the
-// PowerShell call returns.
+// shown none of these issues for creation/formatting/drive-letter assignment. DiscUtils
+// remains only for the ISO-reading fallback (IsoFileSystemOpener), a lower-risk
+// read-only concern that hasn't had a real-hardware bug.
+//
+// One further real-hardware finding: New-Partition's -MbrType parameter's accepted
+// enum values vary by Windows/PowerShell version — this environment's Storage module
+// rejects "EFI" outright ("Cannot convert value 'EFI'... Specify one of: FAT12, FAT16,
+// Extended, Huge, IFS, FAT32"), even though the UEFI:NTFS boot partition needs the
+// 0xEF (EFI System) MBR type byte specifically. diskpart's `set id=` command accepts
+// an arbitrary raw type byte and has been stable across Windows versions since XP, so
+// the boot partition is created via New-Partition/Format-Volume without specifying a
+// type (picking whatever this Windows version defaults to), then diskpart patches just
+// the type byte afterward — narrowly using the one tool that reliably supports it,
+// while keeping PowerShell for everything that needs structured return values
+// (partition numbers, drive letters).
 public class Partitioner : IPartitioner
 {
     private const int BootPartitionMB = 16;
+    private const string EfiSystemMbrTypeHex = "ef";
 
     public async Task<(string bootDriveLetter, string dataDriveLetter)> CreateUefiNtfsLayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
         var diskNumber = ExtractDiskNumber(target.DeviceId);
-        var script = BuildUefiNtfsLayoutScript(diskNumber, BootPartitionMB);
-        var output = await RunPowerShellAsync(script, ct);
-        var letters = ParseDriveLetters(output, expectedCount: 2);
-        return (letters[0], letters[1]);
+
+        await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
+
+        var (bootPartitionNumber, bootDriveLetter) = await CreatePartitionAsync(
+            diskNumber, sizeMB: BootPartitionMB, isActive: true, fileSystem: "FAT", ct);
+
+        await SetPartitionTypeAsync(diskNumber, bootPartitionNumber, EfiSystemMbrTypeHex, ct);
+
+        var (_, dataDriveLetter) = await CreatePartitionAsync(
+            diskNumber, sizeMB: null, isActive: false, fileSystem: "NTFS", ct);
+
+        return (bootDriveLetter, dataDriveLetter);
     }
 
     public async Task<string> CreateLegacyFat32LayoutAsync(
         UsbDriveInfo target, CancellationToken ct = default)
     {
         var diskNumber = ExtractDiskNumber(target.DeviceId);
-        var script = BuildLegacyFat32LayoutScript(diskNumber);
-        var output = await RunPowerShellAsync(script, ct);
-        var letters = ParseDriveLetters(output, expectedCount: 1);
-        return letters[0];
+
+        await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
+
+        // FAT32 is a valid -MbrType enum value on every Windows version seen so far
+        // (unlike EFI above), so no diskpart type-byte patch is needed here.
+        var (_, driveLetter) = await CreatePartitionAsync(
+            diskNumber, sizeMB: null, isActive: true, fileSystem: "FAT32", ct);
+
+        return driveLetter;
     }
 
     internal static int ExtractDiskNumber(string deviceId)
@@ -56,37 +77,33 @@ public class Partitioner : IPartitioner
         return int.Parse(match.Groups[1].Value);
     }
 
-    // Single-quoted PowerShell strings throughout (no embedded double quotes) so the
-    // whole script can be wrapped in double quotes as one process argument without
-    // needing to escape anything inside it.
     // Clear-Disk (RemoveData+RemoveOEM) wipes partitions/data but does not reliably
     // reset a disk's PartitionStyle back to RAW — a disk that was already MBR-
     // initialized from a prior run stays MBR-initialized after Clear-Disk. Calling
     // Initialize-Disk unconditionally then fails with "The disk has already been
     // initialized" (reproduced on real hardware on a second/third flash of the same
     // drive in this session). Only initialize when the disk actually comes back RAW.
-    private const string InitializeIfRawSnippet =
-        "if ((Get-Disk -Number {0}).PartitionStyle -eq 'RAW') {{ Initialize-Disk -Number {0} -PartitionStyle MBR -Confirm:$false }}; ";
-
-    internal static string BuildUefiNtfsLayoutScript(int diskNumber, int bootPartitionMB) =>
+    internal static string BuildClearAndInitializeScript(int diskNumber) =>
         $"$ErrorActionPreference = 'Stop'; " +
         $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
-        string.Format(InitializeIfRawSnippet, diskNumber) +
-        $"$boot = New-Partition -DiskNumber {diskNumber} -Size {bootPartitionMB}MB -MbrType EFI -IsActive -AssignDriveLetter; " +
-        $"Format-Volume -Partition $boot -FileSystem FAT -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
-        $"$data = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -AssignDriveLetter; " +
-        $"Format-Volume -Partition $data -FileSystem NTFS -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
-        $"'{{0}}:|{{1}}:' -f $boot.DriveLetter, $data.DriveLetter";
+        $"if ((Get-Disk -Number {diskNumber}).PartitionStyle -eq 'RAW') " +
+        $"{{ Initialize-Disk -Number {diskNumber} -PartitionStyle MBR -Confirm:$false }}";
 
-    internal static string BuildLegacyFat32LayoutScript(int diskNumber) =>
-        $"$ErrorActionPreference = 'Stop'; " +
-        $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
-        string.Format(InitializeIfRawSnippet, diskNumber) +
-        $"$part = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -MbrType FAT32 -IsActive -AssignDriveLetter; " +
-        $"Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
-        $"'{{0}}:' -f $part.DriveLetter";
+    // Single-quoted PowerShell strings throughout (no embedded double quotes) so the
+    // whole script can be wrapped in double quotes as one process argument without
+    // needing to escape anything inside it. sizeMB null means -UseMaximumSize.
+    internal static string BuildCreatePartitionScript(int diskNumber, int? sizeMB, bool isActive, string fileSystem)
+    {
+        var sizeArg = sizeMB is { } mb ? $"-Size {mb}MB" : "-UseMaximumSize";
+        var activeArg = isActive ? " -IsActive" : "";
 
-    internal static IReadOnlyList<string> ParseDriveLetters(string output, int expectedCount)
+        return $"$ErrorActionPreference = 'Stop'; " +
+            $"$p = New-Partition -DiskNumber {diskNumber} {sizeArg}{activeArg} -AssignDriveLetter; " +
+            $"Format-Volume -Partition $p -FileSystem {fileSystem} -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
+            $"'{{0}}|{{1}}:' -f $p.PartitionNumber, $p.DriveLetter";
+    }
+
+    internal static (int partitionNumber, string driveLetter) ParsePartitionResult(string output)
     {
         var line = output
             .Split('\n')
@@ -95,24 +112,60 @@ public class Partitioner : IPartitioner
 
         if (string.IsNullOrEmpty(line))
         {
-            throw new IOException("Tidak mendapat drive letter dari proses partisi/format.");
+            throw new IOException("Tidak mendapat info partisi dari proses format drive.");
         }
 
-        var letters = line.Split('|');
-        if (letters.Length != expectedCount || letters.Any(l => l.Length < 2 || !char.IsLetter(l[0]) || l[^1] != ':'))
+        var parts = line.Split('|');
+        if (parts.Length != 2 || !int.TryParse(parts[0], out var partitionNumber)
+            || parts[1].Length < 2 || !char.IsLetter(parts[1][0]) || parts[1][^1] != ':')
         {
-            throw new IOException($"Format drive letter tidak dikenali: '{line}'.");
+            throw new IOException($"Format hasil partisi tidak dikenali: '{line}'.");
         }
 
-        return letters;
+        return (partitionNumber, parts[1]);
     }
 
-    private static async Task<string> RunPowerShellAsync(string script, CancellationToken ct)
+    private static async Task<(int partitionNumber, string driveLetter)> CreatePartitionAsync(
+        int diskNumber, int? sizeMB, bool isActive, string fileSystem, CancellationToken ct)
+    {
+        var script = BuildCreatePartitionScript(diskNumber, sizeMB, isActive, fileSystem);
+        var output = await RunPowerShellAsync(script, ct);
+        return ParsePartitionResult(output);
+    }
+
+    internal static string BuildSetPartitionTypeDiskpartScript(int diskNumber, int partitionNumber, string mbrTypeHex) =>
+        $"select disk {diskNumber}\r\n" +
+        $"select partition {partitionNumber}\r\n" +
+        $"set id={mbrTypeHex} override\r\n";
+
+    private static async Task SetPartitionTypeAsync(int diskNumber, int partitionNumber, string mbrTypeHex, CancellationToken ct)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"kangbooting-diskpart-{Guid.NewGuid():N}.txt");
+        await File.WriteAllTextAsync(scriptPath, BuildSetPartitionTypeDiskpartScript(diskNumber, partitionNumber, mbrTypeHex), ct);
+        try
+        {
+            await RunProcessAsync("diskpart.exe", $"/s \"{scriptPath}\"", ct,
+                errorPrefix: "Gagal mengatur tipe partisi boot");
+        }
+        finally
+        {
+            File.Delete(scriptPath);
+        }
+    }
+
+    private static Task<string> RunPowerShellAsync(string script, CancellationToken ct) =>
+        RunProcessAsync(
+            "powershell.exe",
+            $"-NoProfile -NonInteractive -Command \"{script.Replace("\"", "\\\"")}\"",
+            ct,
+            errorPrefix: "Gagal partisi/format drive");
+
+    private static async Task<string> RunProcessAsync(string fileName, string arguments, CancellationToken ct, string errorPrefix)
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = "powershell.exe",
-            Arguments = $"-NoProfile -NonInteractive -Command \"{script.Replace("\"", "\\\"")}\"",
+            FileName = fileName,
+            Arguments = arguments,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -120,7 +173,7 @@ public class Partitioner : IPartitioner
         };
 
         using var process = Process.Start(startInfo)
-            ?? throw new IOException("Gagal menjalankan powershell.exe untuk partisi/format drive.");
+            ?? throw new IOException($"Gagal menjalankan {fileName}.");
 
         // Drain both streams concurrently — see DismRunner/BootsectRunner for why
         // sequential reads risk a pipe-buffer deadlock.
@@ -135,8 +188,8 @@ public class Partitioner : IPartitioner
         if (process.ExitCode != 0)
         {
             throw new IOException(
-                $"Gagal partisi/format drive (exit code {process.ExitCode}): " +
-                (string.IsNullOrWhiteSpace(stderr) ? "Tidak ada detail error." : stderr.Trim()));
+                $"{errorPrefix} (exit code {process.ExitCode}): " +
+                (string.IsNullOrWhiteSpace(stderr) ? stdout.Trim() : stderr.Trim()));
         }
 
         return stdout;

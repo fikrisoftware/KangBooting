@@ -87,7 +87,7 @@
                 <Button x:Name="RetryButton" Content="Coba Lagi" Click="RetryButton_Click" Visibility="Collapsed" />
             </StackPanel>
 
-            <TextBlock x:Name="ErrorTextBlock" Foreground="Red" TextWrapping="Wrap" Visibility="Collapsed" />
+            <TextBlock x:Name="ErrorTextBlock" Foreground="Red" TextWrapping="Wrap" Visibility="Collapsed" IsTextSelectionEnabled="True" />
         </StackPanel>
     </ScrollViewer>
 </Window>
