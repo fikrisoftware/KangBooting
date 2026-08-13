@@ -90,6 +90,13 @@ public class PartitionerTests
         Assert.Contains(@"Device Parameters\Partmgr", script);
         Assert.Contains("RemovableMedia", script);
         Assert.Contains("'FLAG_SET'", script);
+        // Regression guard: real-hardware bug — a stale disk number (drive replugged
+        // and reassigned a different PHYSICALDRIVEn) made $dd resolve to $null, whose
+        // .PNPDeviceID is also $null, silently producing a bogus device-less registry
+        // path that New-Item created anyway while reporting misleading success. Must
+        // check for $null explicitly before touching the registry at all.
+        Assert.Contains("$null -eq $dd", script);
+        Assert.Contains("'NOT_FOUND'", script);
     }
 
     [Fact]

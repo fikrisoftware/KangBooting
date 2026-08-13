@@ -29,12 +29,16 @@
                     CornerRadius="8" Padding="16">
                 <StackPanel Spacing="8">
                     <TextBlock Text="2. Pilih Drive USB" FontWeight="SemiBold" />
-                    <ComboBox x:Name="DriveComboBox"
-                              Width="480"
-                              PlaceholderText="Pilih drive USB"
-                              ItemsSource="{x:Bind ViewModel.AvailableDrives}"
-                              SelectedItem="{x:Bind ViewModel.SelectedDrive, Mode=TwoWay}"
-                              DisplayMemberPath="DisplayName" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <ComboBox x:Name="DriveComboBox"
+                                  Width="420"
+                                  PlaceholderText="Pilih drive USB"
+                                  ItemsSource="{x:Bind ViewModel.AvailableDrives}"
+                                  SelectedItem="{x:Bind ViewModel.SelectedDrive, Mode=TwoWay}"
+                                  DisplayMemberPath="DisplayName" />
+                        <Button x:Name="RefreshDrivesButton" Content="Refresh" Click="RefreshDrivesButton_Click" />
+                    </StackPanel>
+                    <TextBlock Text="⚠ Cabut-pasang ulang flashdisk? Klik Refresh dulu sebelum pilih drive — nomor disk bisa berubah." Opacity="0.7" FontSize="12" />
                     <TextBlock Text="⚠ Semua data di drive ini akan terhapus permanen saat Flash." Opacity="0.7" FontSize="12" />
                 </StackPanel>
             </Border>

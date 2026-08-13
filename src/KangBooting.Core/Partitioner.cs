@@ -103,7 +103,15 @@ public class Partitioner : IPartitioner
     internal static string BuildCheckAndFixRemovableFlagScript(string deviceId) =>
         $"$ErrorActionPreference = 'Stop'; " +
         $"$dd = Get-WmiObject Win32_DiskDrive | Where-Object {{ $_.DeviceID -eq '{deviceId}' }}; " +
-        $"if ($dd.MediaType -eq 'Fixed hard disk media') {{ 'FIXED' }} " +
+        // Real-hardware bug: without this null check, a stale disk number (e.g. after
+        // the drive was unplugged/replugged and Windows assigned it a different
+        // PHYSICALDRIVEn) made $dd silently resolve to $null. $dd.PNPDeviceID on null
+        // is also $null, so the registry path below collapsed to a bogus, device-less
+        // path ('...Enum\Device Parameters\Partmgr') that New-Item happily created
+        // anyway — reporting the misleading success 'FLAG_SET' while never touching the
+        // real device at all.
+        $"if ($null -eq $dd) {{ 'NOT_FOUND' }} " +
+        $"elseif ($dd.MediaType -eq 'Fixed hard disk media') {{ 'FIXED' }} " +
         $"else {{ " +
         $"$regPath = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + $dd.PNPDeviceID + '\\Device Parameters\\Partmgr'; " +
         $"New-Item -Path $regPath -Force | Out-Null; " +
@@ -115,6 +123,13 @@ public class Partitioner : IPartitioner
         var script = BuildCheckAndFixRemovableFlagScript(deviceId);
         var output = await RunPowerShellAsync(script, ct);
         var result = output.Trim();
+
+        if (result == "NOT_FOUND")
+        {
+            throw new IOException(
+                "Drive tidak ditemukan di nomor disk yang tersimpan — kemungkinan nomor disk berubah setelah " +
+                "cabut-pasang. Refresh daftar drive, pilih ulang drive-nya, lalu klik Flash lagi.");
+        }
 
         if (result == "FLAG_SET")
         {

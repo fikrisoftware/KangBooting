@@ -81,6 +81,20 @@ public sealed partial class MainWindow : Window
         LegacySplitRadio.IsChecked = ViewModel.SelectedBootMode == BootMode.LegacySplitFat32;
     }
 
+    private void RefreshDrivesButton_Click(object sender, RoutedEventArgs e)
+    {
+        ErrorTextBlock.Visibility = Visibility.Collapsed;
+        try
+        {
+            ViewModel.RefreshDrives();
+        }
+        catch (Exception ex)
+        {
+            ErrorTextBlock.Text = ex.Message;
+            ErrorTextBlock.Visibility = Visibility.Visible;
+        }
+    }
+
     private void BootModeRadio_Checked(object sender, RoutedEventArgs e)
     {
         ViewModel.SelectedBootMode = ReferenceEquals(sender, UefiNtfsRadio)
