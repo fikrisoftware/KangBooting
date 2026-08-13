@@ -104,7 +104,7 @@ public sealed partial class MainWindow : Window
         // own validation surface that clearer error instead.
         if (ViewModel.SelectedIsoPath is not null && ViewModel.SelectedDrive is not null)
         {
-            var confirmed = await ConfirmFlashAsync(ViewModel.SelectedDrive.DisplayName);
+            var confirmed = await ConfirmFlashAsync(ViewModel.SelectedDrive.DisplayName, ViewModel.SelectedBootMode);
             if (!confirmed)
             {
                 return;
@@ -141,12 +141,26 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task<bool> ConfirmFlashAsync(string driveDisplayName)
+    private async Task<bool> ConfirmFlashAsync(string driveDisplayName, BootMode bootMode)
     {
+        var content = $"Semua data di drive \"{driveDisplayName}\" akan dihapus permanen dan tidak bisa dikembalikan.";
+        if (bootMode == BootMode.UefiNtfs)
+        {
+            // Windows refuses to format NTFS on media it classifies "Removable" — most
+            // USB flash drives. If this drive is still Removable, KangBooting will flip
+            // its own driver-level "RemovableMedia" setting to make Windows treat it as
+            // Fixed. This is a permanent change to that specific USB device (not undone
+            // by unplugging it, and not specific to this app), so it needs its own
+            // explicit heads-up beyond the generic data-wipe warning above.
+            content += " Mode UEFI:NTFS juga mungkin perlu mengubah setting drive ini di registry Windows " +
+                "(dari 'Removable' menjadi 'Fixed') agar bisa diformat NTFS — perubahan ini permanen pada drive tersebut.";
+        }
+        content += " Lanjutkan?";
+
         var dialog = new ContentDialog
         {
             Title = "Konfirmasi Flash",
-            Content = $"Semua data di drive \"{driveDisplayName}\" akan dihapus permanen dan tidak bisa dikembalikan. Lanjutkan?",
+            Content = content,
             PrimaryButtonText = "Ya, Flash",
             CloseButtonText = "Batal",
             DefaultButton = ContentDialogButton.Close,

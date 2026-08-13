@@ -76,6 +76,23 @@ public class PartitionerTests
     }
 
     [Fact]
+    public void BuildCheckAndFixRemovableFlagScript_ChecksMediaTypeAndPatchesRegistryWhenRemovable()
+    {
+        var script = Partitioner.BuildCheckAndFixRemovableFlagScript(@"\\.\PHYSICALDRIVE1");
+
+        Assert.Contains(@"$_.DeviceID -eq '\\.\PHYSICALDRIVE1'", script);
+        Assert.Contains("'Fixed hard disk media'", script);
+        Assert.Contains("'FIXED'", script);
+        // Regression guard: real-hardware finding — Format-Volume, diskpart, format.com,
+        // AND Explorer's own GUI format dialog all refuse NTFS on removable media. The
+        // fix patches this specific device's own Partmgr\RemovableMedia registry value,
+        // not a global Windows setting.
+        Assert.Contains(@"Device Parameters\Partmgr", script);
+        Assert.Contains("RemovableMedia", script);
+        Assert.Contains("'FLAG_SET'", script);
+    }
+
+    [Fact]
     public void ParsePartitionResult_ParsesNumberAndDriveLetter()
     {
         var (number, letter) = Partitioner.ParsePartitionResult("2|F:");

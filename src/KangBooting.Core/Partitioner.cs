@@ -37,6 +37,17 @@ public class Partitioner : IPartitioner
     {
         var diskNumber = ExtractDiskNumber(target.DeviceId);
 
+        // Real-hardware finding, confirmed four separate ways (PowerShell Format-Volume,
+        // diskpart, format.com, and Windows Explorer's own GUI format dialog): Windows
+        // refuses to create an NTFS volume on media it classifies as "Removable" — most
+        // USB flash drives. This is a genuine OS-level restriction, not a bug in any one
+        // tool. The fix is the same one NTFS-on-USB tools like Rufus rely on: flip the
+        // drive's own Partmgr "RemovableMedia" flag to 0 so Windows treats it as Fixed —
+        // but that flag change only takes effect after the device is unplugged and
+        // replugged, so this fails fast with an actionable message instead of formatting
+        // the boot partition first and only then discovering NTFS won't work.
+        await EnsureFixedMediaAsync(target.DeviceId, ct);
+
         await RunPowerShellAsync(BuildClearAndInitializeScript(diskNumber), ct);
 
         var (bootPartitionNumber, bootDriveLetter) = await CreatePartitionOnlyAsync(
@@ -78,6 +89,45 @@ public class Partitioner : IPartitioner
         await FormatWithFormatExeAsync(driveLetter, "FAT32", ct);
 
         return driveLetter;
+    }
+
+    // WMI's Win32_DiskDrive.MediaType reports "Fixed hard disk media" or "Removable
+    // Media" (or a blank/other string for some controllers) — the same classification
+    // Format-Volume/diskpart/format.com/Explorer all consult before refusing NTFS.
+    // Flipping HKLM's per-device Partmgr\RemovableMedia value to 0 is the documented
+    // workaround (used by NTFS-on-USB tools generally) that makes Windows treat the
+    // device as Fixed from its next connection onward. This is a real, permanent change
+    // to that specific USB device's driver parameters — not undone by unplugging it, and
+    // not scoped to just this app or this flash — so the caller must have confirmed this
+    // with the user before reaching here.
+    internal static string BuildCheckAndFixRemovableFlagScript(string deviceId) =>
+        $"$ErrorActionPreference = 'Stop'; " +
+        $"$dd = Get-WmiObject Win32_DiskDrive | Where-Object {{ $_.DeviceID -eq '{deviceId}' }}; " +
+        $"if ($dd.MediaType -eq 'Fixed hard disk media') {{ 'FIXED' }} " +
+        $"else {{ " +
+        $"$regPath = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + $dd.PNPDeviceID + '\\Device Parameters\\Partmgr'; " +
+        $"New-Item -Path $regPath -Force | Out-Null; " +
+        $"New-ItemProperty -Path $regPath -Name 'RemovableMedia' -PropertyType DWord -Value 0 -Force | Out-Null; " +
+        $"'FLAG_SET' }}";
+
+    private static async Task EnsureFixedMediaAsync(string deviceId, CancellationToken ct)
+    {
+        var script = BuildCheckAndFixRemovableFlagScript(deviceId);
+        var output = await RunPowerShellAsync(script, ct);
+        var result = output.Trim();
+
+        if (result == "FLAG_SET")
+        {
+            throw new IOException(
+                "Drive ini terdeteksi Windows sebagai 'Removable', yang tidak mendukung format NTFS. " +
+                "KangBooting sudah mengubah setting drive ini menjadi 'Fixed' di registry — " +
+                "CABUT dan PASANG ULANG flashdisk ini, lalu klik Flash lagi untuk melanjutkan.");
+        }
+
+        if (result != "FIXED")
+        {
+            throw new IOException($"Tidak bisa memastikan status media drive: '{result}'.");
+        }
     }
 
     internal static int ExtractDiskNumber(string deviceId)
