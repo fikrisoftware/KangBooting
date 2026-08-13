@@ -1,5 +1,4 @@
 using DiscUtils;
-using DiscUtils.Iso9660;
 
 namespace KangBooting.Core;
 
@@ -51,12 +50,12 @@ public class LegacySplitWriter : IWriteEngine
         try
         {
             using (var isoStream = File.OpenRead(isoPath))
-            using (var cdReader = new CDReader(isoStream, joliet: true))
+            using (var isoFileSystem = IsoFileSystemOpener.Open(isoStream))
             {
                 progress.Report(new WriteProgress(10, 0, null, "Extracting ISO"));
-                var extractTotalBytes = ComputeTotalBytes(cdReader);
+                var extractTotalBytes = ComputeTotalBytes(isoFileSystem);
                 var extractTracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 30, "Extracting ISO", extractTotalBytes);
-                ExtractIsoToDirectory(cdReader, stagingDir, tracker: extractTracker, ct: ct);
+                ExtractIsoToDirectory(isoFileSystem, stagingDir, tracker: extractTracker, ct: ct);
             }
 
             await SplitInstallImageIfNeededAsync(stagingDir, progress, ct);
@@ -154,7 +153,7 @@ public class LegacySplitWriter : IWriteEngine
     }
 
     internal static void ExtractIsoToDirectory(
-        CDReader source, string destinationDir, string path = "",
+        IFileSystem source, string destinationDir, string path = "",
         CopyProgressTracker? tracker = null, CancellationToken ct = default)
     {
         // ponytail: GetDirectories(path)/GetFiles(path) without SearchOption default to
@@ -192,7 +191,7 @@ public class LegacySplitWriter : IWriteEngine
         return semicolonIndex >= 0 ? isoPath[..semicolonIndex] : isoPath;
     }
 
-    private static long ComputeTotalBytes(CDReader source, string path = "")
+    private static long ComputeTotalBytes(IFileSystem source, string path = "")
     {
         long total = 0;
         foreach (var dir in source.GetDirectories(path))

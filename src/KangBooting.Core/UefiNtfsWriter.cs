@@ -1,5 +1,4 @@
 using DiscUtils;
-using DiscUtils.Iso9660;
 
 namespace KangBooting.Core;
 
@@ -23,7 +22,7 @@ public class UefiNtfsWriter : IWriteEngine
         progress.Report(new WriteProgress(0, 0, null, "Formatting"));
 
         using var isoStream = File.OpenRead(isoPath);
-        using var cdReader = new CDReader(isoStream, joliet: true);
+        using var isoFileSystem = IsoFileSystemOpener.Open(isoStream);
 
         using (var volumeLock = _driveService.LockVolume(target.DeviceId))
         {
@@ -39,9 +38,9 @@ public class UefiNtfsWriter : IWriteEngine
                 progress.Report(new WriteProgress(10, 0, null, "Copying files"));
 
                 using var ntfs = _partitioner.OpenNtfsFileSystem(dataPartition);
-                var totalBytes = ComputeTotalBytes(cdReader);
+                var totalBytes = ComputeTotalBytes(isoFileSystem);
                 var tracker = new CopyProgressTracker(progress, rangeStart: 10, rangeSpan: 88, "Copying files", totalBytes);
-                CopyIsoContentsToFileSystem(cdReader, ntfs, tracker, ct);
+                CopyIsoContentsToFileSystem(isoFileSystem, ntfs, tracker, ct);
             }
             finally
             {
@@ -57,7 +56,7 @@ public class UefiNtfsWriter : IWriteEngine
     }
 
     internal static void CopyIsoContentsToFileSystem(
-        CDReader source,
+        IFileSystem source,
         IFileSystem destination,
         CopyProgressTracker? tracker = null,
         CancellationToken ct = default)
@@ -66,7 +65,7 @@ public class UefiNtfsWriter : IWriteEngine
     }
 
     private static void CopyDirectory(
-        CDReader source,
+        IFileSystem source,
         IFileSystem destination,
         string path,
         CopyProgressTracker? tracker,
@@ -94,7 +93,7 @@ public class UefiNtfsWriter : IWriteEngine
         }
     }
 
-    private static long ComputeTotalBytes(CDReader source, string path = "")
+    private static long ComputeTotalBytes(IFileSystem source, string path = "")
     {
         long total = 0;
         foreach (var dir in source.GetDirectories(path))

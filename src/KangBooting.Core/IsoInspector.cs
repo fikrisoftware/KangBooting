@@ -1,4 +1,4 @@
-using DiscUtils.Iso9660;
+using DiscUtils;
 
 namespace KangBooting.Core;
 
@@ -12,21 +12,27 @@ public class IsoInspector : IIsoInspector
     public Task<IsoAnalysis> AnalyzeAsync(string isoPath, CancellationToken ct = default)
     {
         using var fs = File.OpenRead(isoPath);
-        using var cdReader = new CDReader(fs, joliet: true);
+        using var reader = IsoFileSystemOpener.Open(fs);
 
-        long? installImageSize = TryGetFileSize(cdReader, @"sources\install.wim")
-            ?? TryGetFileSize(cdReader, @"sources\install.esd");
+        long? installImageSize = TryGetFileSize(reader, @"sources\install.wim")
+            ?? TryGetFileSize(reader, @"sources\install.esd");
 
-        bool hasBiosBoot = cdReader.FileExists(@"boot\etfsboot.com")
-            || cdReader.FileExists(@"boot.bin");
+        // NOTE: etfsboot.com lives in the ISO9660 "El Torito" boot catalog area, which
+        // is part of the classic ISO9660 layer even on discs whose real file content is
+        // UDF (see IsoFileSystemOpener). On such discs this check will not find it via
+        // the UDF reader, so HasBiosBootSector may read false even for a disc that does
+        // support BIOS boot — this only affects BootModeRecommender's suggested default,
+        // not correctness of an explicitly-chosen write mode (users can still override).
+        bool hasBiosBoot = reader.FileExists(@"boot\etfsboot.com")
+            || reader.FileExists(@"boot.bin");
 
-        bool hasUefiBoot = cdReader.FileExists(@"efi\boot\bootx64.efi");
+        bool hasUefiBoot = reader.FileExists(@"efi\boot\bootx64.efi");
 
         var analysis = new IsoAnalysis(installImageSize, hasBiosBoot, hasUefiBoot);
         return Task.FromResult(analysis);
     }
 
-    private static long? TryGetFileSize(CDReader reader, string path)
+    private static long? TryGetFileSize(IFileSystem reader, string path)
     {
         if (!reader.FileExists(path))
         {
