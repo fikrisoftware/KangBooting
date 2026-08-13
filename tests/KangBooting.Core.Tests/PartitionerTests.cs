@@ -26,6 +26,11 @@ public class PartitionerTests
         var script = Partitioner.BuildUefiNtfsLayoutScript(diskNumber: 2, bootPartitionMB: 16);
 
         Assert.Contains("Clear-Disk -Number 2", script);
+        // Regression guard: real-hardware bug — Initialize-Disk called unconditionally
+        // after Clear-Disk threw "The disk has already been initialized" on a second/
+        // third flash of the same drive, since Clear-Disk doesn't reliably reset
+        // PartitionStyle back to RAW. Must be gated on an actual RAW check.
+        Assert.Contains("if ((Get-Disk -Number 2).PartitionStyle -eq 'RAW')", script);
         Assert.Contains("Initialize-Disk -Number 2 -PartitionStyle MBR", script);
         Assert.Contains("New-Partition -DiskNumber 2 -Size 16MB -MbrType EFI -IsActive -AssignDriveLetter", script);
         Assert.Contains("Format-Volume -Partition $boot -FileSystem FAT", script);

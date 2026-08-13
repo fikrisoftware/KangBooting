@@ -59,10 +59,19 @@ public class Partitioner : IPartitioner
     // Single-quoted PowerShell strings throughout (no embedded double quotes) so the
     // whole script can be wrapped in double quotes as one process argument without
     // needing to escape anything inside it.
+    // Clear-Disk (RemoveData+RemoveOEM) wipes partitions/data but does not reliably
+    // reset a disk's PartitionStyle back to RAW — a disk that was already MBR-
+    // initialized from a prior run stays MBR-initialized after Clear-Disk. Calling
+    // Initialize-Disk unconditionally then fails with "The disk has already been
+    // initialized" (reproduced on real hardware on a second/third flash of the same
+    // drive in this session). Only initialize when the disk actually comes back RAW.
+    private const string InitializeIfRawSnippet =
+        "if ((Get-Disk -Number {0}).PartitionStyle -eq 'RAW') {{ Initialize-Disk -Number {0} -PartitionStyle MBR -Confirm:$false }}; ";
+
     internal static string BuildUefiNtfsLayoutScript(int diskNumber, int bootPartitionMB) =>
         $"$ErrorActionPreference = 'Stop'; " +
         $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
-        $"Initialize-Disk -Number {diskNumber} -PartitionStyle MBR -Confirm:$false; " +
+        string.Format(InitializeIfRawSnippet, diskNumber) +
         $"$boot = New-Partition -DiskNumber {diskNumber} -Size {bootPartitionMB}MB -MbrType EFI -IsActive -AssignDriveLetter; " +
         $"Format-Volume -Partition $boot -FileSystem FAT -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
         $"$data = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -AssignDriveLetter; " +
@@ -72,7 +81,7 @@ public class Partitioner : IPartitioner
     internal static string BuildLegacyFat32LayoutScript(int diskNumber) =>
         $"$ErrorActionPreference = 'Stop'; " +
         $"Clear-Disk -Number {diskNumber} -RemoveData -RemoveOEM -Confirm:$false; " +
-        $"Initialize-Disk -Number {diskNumber} -PartitionStyle MBR -Confirm:$false; " +
+        string.Format(InitializeIfRawSnippet, diskNumber) +
         $"$part = New-Partition -DiskNumber {diskNumber} -UseMaximumSize -MbrType FAT32 -IsActive -AssignDriveLetter; " +
         $"Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel 'KANGBOOT' -Confirm:$false -Force | Out-Null; " +
         $"'{{0}}:' -f $part.DriveLetter";
